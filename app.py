@@ -4,6 +4,7 @@ Purpose: Streamlit web app for EA Global meeting matcher
 Mobile-friendly UI for generating personalized meeting recommendations
 """
 
+import hmac
 import os
 import asyncio
 import re
@@ -93,19 +94,33 @@ def check_password(csv_url, app_password, gemini_api_key):
         st.error("⚠️ Missing configuration. Please set CSV_URL, APP_PASSWORD, and GEMINI_API_KEY in secrets.")
         st.stop()
 
+    # Initialize failed attempts tracking
+    if 'failed_attempts' not in st.session_state:
+        st.session_state.failed_attempts = 0
+
     st.title("🔒 EA Global Meeting Matcher")
     st.markdown("This app is password protected. Please enter the password to continue.")
+
+    # Show lockout message if too many failed attempts
+    if st.session_state.failed_attempts >= 5:
+        lockout_seconds = 2 ** st.session_state.failed_attempts
+        st.error(f"⚠️ Too many failed attempts. Please wait ~{lockout_seconds}s before trying again.")
 
     password_input = st.text_input("Password:", type="password", key="password_input")
 
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
         if st.button("🔓 Unlock", use_container_width=True):
-            if password_input == app_password:
+            if hmac.compare_digest(password_input, app_password):
                 st.session_state.authenticated = True
+                st.session_state.failed_attempts = 0
                 st.rerun()
             else:
-                st.error("❌ Incorrect password")
+                st.session_state.failed_attempts += 1
+                if st.session_state.failed_attempts >= 5:
+                    st.error(f"❌ Incorrect password. Too many attempts — please wait before retrying.")
+                else:
+                    st.error(f"❌ Incorrect password ({5 - st.session_state.failed_attempts} attempts remaining)")
 
     st.stop()
 
