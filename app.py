@@ -267,7 +267,7 @@ def main():
 
             # Run dual matching pipeline
             status_container = st.empty()
-            with st.spinner("Running dual matching pipeline (this runs both directions in parallel)..."):
+            with st.spinner("Running dual matching pipeline (This might take a few mins, we are doing multiple rounds of scoring)..."):
                 try:
                     (get_result, give_result) = asyncio.run(
                         run_dual_matching_pipeline(

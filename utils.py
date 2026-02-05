@@ -15,6 +15,26 @@ from rapidfuzz import fuzz, process
 from markdown_to_mrkdwn import SlackMarkdownConverter
 
 
+class RateLimiter:
+    """Token-bucket rate limiter for API calls."""
+
+    def __init__(self, max_per_minute=25):
+        self.max_per_minute = max_per_minute
+        self.interval = 60.0 / max_per_minute  # seconds between requests
+        self._lock = asyncio.Lock()
+        self._last_request_time = 0.0
+
+    async def acquire(self):
+        """Wait until we can make the next request."""
+        async with self._lock:
+            import time
+            now = time.monotonic()
+            wait_time = self._last_request_time + self.interval - now
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+            self._last_request_time = time.monotonic()
+
+
 def get_export_url(sheet_url):
     """Convert Google Sheets URL to CSV export URL."""
     sheet_id = sheet_url.split('/d/')[1].split('/')[0]
@@ -204,7 +224,7 @@ Rank from #1 (strongest) to #25. Start directly with the recommendations, no pre
 
 async def run_matching_pipeline(df_filtered, user_name, user_profile, api_key, model,
                                 chunk_size=50, min_score=8, additional_context=None,
-                                direction="get_value", user_idx=None, semaphore=None):
+                                direction="get_value", user_idx=None, rate_limiter=None):
     """
     Run the matching pipeline for a single direction:
     1. Score all profiles in batches (in parallel, rate-limited)
@@ -214,14 +234,14 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, api_key, m
     Args:
         direction: "get_value" (who benefits me) or "give_value" (who I can help)
         user_idx: DataFrame index of the user's own profile to exclude from scoring
-        semaphore: asyncio.Semaphore for rate limiting API calls (shared across pipelines)
+        rate_limiter: RateLimiter instance for rate limiting API calls (shared across pipelines)
 
     Returns:
         Tuple of (recommendations_text, all_scores_dict, status_messages)
     """
     client = genai.Client(api_key=api_key)
-    if semaphore is None:
-        semaphore = asyncio.Semaphore(10)
+    if rate_limiter is None:
+        rate_limiter = RateLimiter(max_per_minute=25)
     status_messages = []
     direction_label = "GET value" if direction == "get_value" else "GIVE value"
     status_messages.append(f"=== {direction_label} ===")
@@ -257,35 +277,35 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, api_key, m
 
         backoff_delays = [5, 10, 20]
         for attempt in range(3):
-            async with semaphore:
-                try:
-                    response = await client.aio.models.generate_content(
-                        model=model,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            temperature=1,
-                            response_mime_type="application/json"
-                        )
+            await rate_limiter.acquire()
+            try:
+                response = await client.aio.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=1,
+                        response_mime_type="application/json"
                     )
+                )
 
-                    if not response.text:
-                        raise ValueError(f"Empty response for batch {batch_num}")
+                if not response.text:
+                    raise ValueError(f"Empty response for batch {batch_num}")
 
-                    scores = json.loads(response.text)
+                scores = json.loads(response.text)
 
-                    # Map profile numbers back to df indices
-                    result = {}
-                    for j, idx in enumerate(batch_indices, 1):
-                        score = scores.get(str(j), scores.get(j, 0))
-                        result[idx] = score
+                # Map profile numbers back to df indices
+                result = {}
+                for j, idx in enumerate(batch_indices, 1):
+                    score = scores.get(str(j), scores.get(j, 0))
+                    result[idx] = score
 
-                    return result, batch_num
+                return result, batch_num
 
-                except Exception as e:
-                    if attempt < 2:
-                        await asyncio.sleep(backoff_delays[attempt])
-                    else:
-                        raise ValueError(f"Batch {batch_num} failed after {attempt + 1} attempts: {e}")
+            except Exception as e:
+                if attempt < 2:
+                    await asyncio.sleep(backoff_delays[attempt])
+                else:
+                    raise ValueError(f"Batch {batch_num} failed after {attempt + 1} attempts: {e}")
 
     # Run all batches in parallel
     try:
@@ -334,24 +354,24 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, api_key, m
 
     backoff_delays = [5, 10, 20]
     for attempt in range(3):
-        async with semaphore:
-            try:
-                final_response = await client.aio.models.generate_content(
-                    model=model,
-                    contents=final_prompt,
-                    config=types.GenerateContentConfig(temperature=1)
-                )
-                if not final_response.text:
-                    raise ValueError("Empty response from final recommendation call")
-                status_messages.append("Final recommendations generated")
-                return final_response.text, all_scores, status_messages
-            except Exception as e:
-                if attempt < 2:
-                    status_messages.append(f"Final call failed, retrying in {backoff_delays[attempt]}s...")
-                    await asyncio.sleep(backoff_delays[attempt])
-                else:
-                    status_messages.append(f"Final recommendation failed: {e}")
-                    raise
+        await rate_limiter.acquire()
+        try:
+            final_response = await client.aio.models.generate_content(
+                model=model,
+                contents=final_prompt,
+                config=types.GenerateContentConfig(temperature=1)
+            )
+            if not final_response.text:
+                raise ValueError("Empty response from final recommendation call")
+            status_messages.append("Final recommendations generated")
+            return final_response.text, all_scores, status_messages
+        except Exception as e:
+            if attempt < 2:
+                status_messages.append(f"Final call failed, retrying in {backoff_delays[attempt]}s...")
+                await asyncio.sleep(backoff_delays[attempt])
+            else:
+                status_messages.append(f"Final recommendation failed: {e}")
+                raise
 
 
 async def run_dual_matching_pipeline(df_filtered, user_name, user_profile, api_key, model,
@@ -364,18 +384,18 @@ async def run_dual_matching_pipeline(df_filtered, user_name, user_profile, api_k
         Tuple of (get_result, give_result)
         where each result is (recommendations_text, all_scores_dict, status_messages)
     """
-    # Shared semaphore to stay under Gemini's 25 RPM rate limit
-    semaphore = asyncio.Semaphore(10)
+    # Shared rate limiter to stay under Gemini's 25 RPM rate limit
+    rate_limiter = RateLimiter(max_per_minute=22)  # slightly under 25 to leave headroom
 
     get_task = run_matching_pipeline(
         df_filtered, user_name, user_profile, api_key, model,
         chunk_size=chunk_size, min_score=min_score, additional_context=additional_context,
-        direction="get_value", user_idx=user_idx, semaphore=semaphore
+        direction="get_value", user_idx=user_idx, rate_limiter=rate_limiter
     )
     give_task = run_matching_pipeline(
         df_filtered, user_name, user_profile, api_key, model,
         chunk_size=chunk_size, min_score=min_score, additional_context=additional_context,
-        direction="give_value", user_idx=user_idx, semaphore=semaphore
+        direction="give_value", user_idx=user_idx, rate_limiter=rate_limiter
     )
     return await asyncio.gather(get_task, give_task)
 
