@@ -5,22 +5,20 @@ Mobile-friendly UI for generating personalized meeting recommendations
 """
 
 import os
-import sys
 import asyncio
+import re
 import streamlit as st
 import pandas as pd
 
-# Add parent directory to path to import utils
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import (
     load_csv_from_url,
     find_matches,
     format_row_as_pipe_delimited,
+    format_profile_for_llm,
     format_profile_display,
-    create_prompt,
-    send_to_gemini_parallel,
+    filter_profiles,
+    run_dual_matching_pipeline,
     save_output,
-    generate_output_md_content
 )
 
 # Page config - mobile-friendly
@@ -31,9 +29,18 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+# Constrain max width and fix line break rendering
+st.markdown("""
+<style>
+    .block-container { max-width: 1100px; }
+    .stMarkdown p { white-space: pre-wrap; }
+</style>
+""", unsafe_allow_html=True)
+
 # Configuration
 OUTPUT_DIR = "outputs/matches"
-LLM_MODEL = "gemini-2.5-pro"
+# Gemini 3 Pro Preview just launched - upgrading from gemini-2.5-pro
+LLM_MODEL = "gemini-3-pro-preview"
 
 # Ensure output directory exists
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -45,7 +52,7 @@ def get_config():
         csv_url = st.secrets.get("CSV_URL", "")
         app_password = st.secrets.get("APP_PASSWORD", "")
         gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
-    except:
+    except Exception:
         csv_url = os.environ.get("CSV_URL", "")
         app_password = os.environ.get("APP_PASSWORD", "")
         gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
@@ -63,12 +70,20 @@ if 'selected_match' not in st.session_state:
     st.session_state.selected_match = None
 if 'df' not in st.session_state:
     st.session_state.df = None
-if 'output_md_content' not in st.session_state:
-    st.session_state.output_md_content = None
-if 'recommendations' not in st.session_state:
-    st.session_state.recommendations = None
-if 'slack_recommendations' not in st.session_state:
-    st.session_state.slack_recommendations = None
+if 'df_filtered' not in st.session_state:
+    st.session_state.df_filtered = None
+if 'recommendations_get' not in st.session_state:
+    st.session_state.recommendations_get = None
+if 'slack_recommendations_get' not in st.session_state:
+    st.session_state.slack_recommendations_get = None
+if 'recommendations_give' not in st.session_state:
+    st.session_state.recommendations_give = None
+if 'slack_recommendations_give' not in st.session_state:
+    st.session_state.slack_recommendations_give = None
+if 'scoring_status_get' not in st.session_state:
+    st.session_state.scoring_status_get = None
+if 'scoring_status_give' not in st.session_state:
+    st.session_state.scoring_status_give = None
 
 
 def check_password(csv_url, app_password, gemini_api_key):
@@ -118,18 +133,18 @@ def main():
 
     df = st.session_state.df
 
-    # Generate output.md content (cached in session state)
-    if st.session_state.output_md_content is None:
-        with st.spinner("🔄 Generating filtered profiles (>= 300 chars)..."):
+    # Filter profiles (cached in session state)
+    if st.session_state.df_filtered is None:
+        with st.spinner("🔄 Filtering profiles (>= 300 chars)..."):
             try:
-                content, original_count, filtered_count = generate_output_md_content(csv_url, min_chars=300)
-                st.session_state.output_md_content = content
+                df_filtered, original_count, filtered_count = filter_profiles(df, min_chars=300)
+                st.session_state.df_filtered = df_filtered
                 st.success(f"Filtered profiles: {filtered_count} of {original_count} attendees")
             except Exception as e:
-                st.error(f"Failed to generate profiles: {e}")
+                st.error(f"Failed to filter profiles: {e}")
                 st.stop()
 
-    output_md_content = st.session_state.output_md_content
+    df_filtered = st.session_state.df_filtered
 
     # Step 1: Name search
     st.header("1️⃣ Find Your Profile")
@@ -142,6 +157,7 @@ def main():
             help="We'll use fuzzy matching to find your profile"
         )
     with col2:
+        st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
         search_button = st.button("🔍 Search", type="primary", use_container_width=True)
 
     if search_button and name:
@@ -197,7 +213,8 @@ def main():
                 'type': 'csv',
                 'row': matched_row,
                 'name': match_name,
-                'score': score
+                'score': score,
+                'idx': idx  # positional index in df
             }
 
     # Step 3: Display profile and get additional context
@@ -235,56 +252,84 @@ def main():
         generate_button = st.button("🚀 Generate Meeting Recommendations", type="primary", use_container_width=True)
 
         if generate_button:
-            # Use cached output.md content
-            full_output = output_md_content
-            st.info(f"📊 Using {len(full_output):,} characters of profile data")
-
             # Prepare user profile
             if match_data['type'] == 'custom':
                 user_profile = match_data['profile']
             else:
-                user_profile = format_row_as_pipe_delimited(match_data['row'])
+                user_profile = format_profile_for_llm(match_data['row'])
 
-            # Create prompt
-            with st.spinner("Creating prompt..."):
-                prompt = create_prompt(
-                    match_data['name'],
-                    user_profile,
-                    full_output,
-                    additional_context if additional_context.strip() else None
-                )
-                st.success(f"Prompt created ({len(prompt):,} characters)")
+            st.info(f"📊 Running dual pipeline: scoring {len(df_filtered)} profiles for both GET and GIVE value, then selecting top 25 for each...")
 
-            # Call Gemini API
+            # Get user_idx for excluding from scoring
+            user_idx = None
+            if match_data['type'] == 'csv':
+                user_idx = match_data['idx']
+
+            # Run dual matching pipeline
             status_container = st.empty()
-            with st.spinner("Generating recommendations (this takes ~30-60 seconds)..."):
+            with st.spinner("Running dual matching pipeline (this runs both directions in parallel)..."):
                 try:
-                    # Run async function
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    response, status_messages = loop.run_until_complete(
-                        send_to_gemini_parallel(prompt, api_key, LLM_MODEL)
-                    )
-                    loop.close()
-
-                    # Show status messages
-                    with status_container.expander("📊 Generation details", expanded=False):
-                        for msg in status_messages:
-                            st.text(msg)
-
-                    st.session_state.recommendations = response
-
-                    # Save to files
-                    with st.spinner("Saving results..."):
-                        md_path, txt_path = save_output(
+                    (get_result, give_result) = asyncio.run(
+                        run_dual_matching_pipeline(
+                            df_filtered,
                             match_data['name'],
-                            response,
-                            OUTPUT_DIR
+                            user_profile,
+                            api_key,
+                            LLM_MODEL,
+                            chunk_size=50,
+                            min_score=8,
+                            additional_context=additional_context.strip() if additional_context.strip() else None,
+                            user_idx=user_idx
                         )
+                    )
 
-                    # Load slack version for display
+                    get_response, get_scores, get_status = get_result
+                    give_response, give_scores, give_status = give_result
+
+                    # Show scoring details as bar charts
+                    def parse_score_distribution(status_msgs):
+                        dist = {}
+                        for msg in status_msgs:
+                            m = re.match(r'\s*Score (\d+): (\d+) profiles', msg)
+                            if m:
+                                dist[int(m.group(1))] = int(m.group(2))
+                        return dist
+
+                    get_dist = parse_score_distribution(get_status)
+                    give_dist = parse_score_distribution(give_status)
+
+                    with status_container.expander("📊 Scoring details", expanded=True):
+                        chart_col1, chart_col2 = st.columns(2)
+                        with chart_col1:
+                            st.caption("🎯 Get Value (for you)")
+                            if get_dist:
+                                chart_df = pd.DataFrame({
+                                    "Score": range(1, 11),
+                                    "Profiles": [get_dist.get(i, 0) for i in range(1, 11)]
+                                }).set_index("Score")
+                                st.bar_chart(chart_df)
+                        with chart_col2:
+                            st.caption("🎁 Give Value (for them)")
+                            if give_dist:
+                                chart_df = pd.DataFrame({
+                                    "Score": range(1, 11),
+                                    "Profiles": [give_dist.get(i, 0) for i in range(1, 11)]
+                                }).set_index("Score")
+                                st.bar_chart(chart_df)
+
+                    # Save get_value results
+                    md_path, txt_path = save_output(match_data['name'], get_response, OUTPUT_DIR, suffix="_get_value")
                     with open(txt_path, 'r', encoding='utf-8') as f:
-                        st.session_state.slack_recommendations = f.read()
+                        st.session_state.slack_recommendations_get = f.read()
+                    st.session_state.recommendations_get = get_response
+                    st.session_state.scoring_status_get = get_status
+
+                    # Save give_value results
+                    md_path, txt_path = save_output(match_data['name'], give_response, OUTPUT_DIR, suffix="_give_value")
+                    with open(txt_path, 'r', encoding='utf-8') as f:
+                        st.session_state.slack_recommendations_give = f.read()
+                    st.session_state.recommendations_give = give_response
+                    st.session_state.scoring_status_give = give_status
 
                     st.success("✅ Recommendations generated successfully!")
 
@@ -293,34 +338,56 @@ def main():
                     st.stop()
 
     # Step 5: Display results
-    if st.session_state.recommendations:
+    if st.session_state.recommendations_get:
         st.header("5️⃣ Your Meeting Recommendations")
 
-        tab1, tab2 = st.tabs(["📱 Slack Format (Mobile-Friendly)", "📝 Markdown Format"])
+        main_tab1, main_tab2 = st.tabs(["🎯 Who to Meet FOR YOU", "🎁 Who to Meet TO HELP THEM"])
 
-        with tab1:
-            st.text_area(
-                "Slack/Text Version (ready to copy):",
-                value=st.session_state.slack_recommendations,
-                height=400
-            )
-            st.download_button(
-                label="⬇️ Download Slack Version",
-                data=st.session_state.slack_recommendations,
-                file_name=f"{st.session_state.selected_match['name'].replace(' ', '_')}_recommendations.txt",
-                mime="text/plain",
-                use_container_width=True
-            )
+        with main_tab1:
+            tab1, tab2 = st.tabs(["📝 Markdown", "📱 Slack Format"])
+            with tab1:
+                st.markdown(st.session_state.recommendations_get)
+                st.download_button(
+                    label="⬇️ Download Markdown Version",
+                    data=st.session_state.recommendations_get,
+                    file_name=f"{st.session_state.selected_match['name'].replace(' ', '_')}_get_value.md",
+                    mime="text/markdown",
+                    use_container_width=True,
+                    key="dl_get_md"
+                )
+            with tab2:
+                st.text_area("Slack/Text Version:", value=st.session_state.slack_recommendations_get, height=400)
+                st.download_button(
+                    label="⬇️ Download Slack Version",
+                    data=st.session_state.slack_recommendations_get,
+                    file_name=f"{st.session_state.selected_match['name'].replace(' ', '_')}_get_value.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                    key="dl_get_slack"
+                )
 
-        with tab2:
-            st.markdown(st.session_state.recommendations)
-            st.download_button(
-                label="⬇️ Download Markdown Version",
-                data=st.session_state.recommendations,
-                file_name=f"{st.session_state.selected_match['name'].replace(' ', '_')}_recommendations.md",
-                mime="text/markdown",
-                use_container_width=True
-            )
+        with main_tab2:
+            tab1, tab2 = st.tabs(["📝 Markdown", "📱 Slack Format"])
+            with tab1:
+                st.markdown(st.session_state.recommendations_give)
+                st.download_button(
+                    label="⬇️ Download Markdown Version",
+                    data=st.session_state.recommendations_give,
+                    file_name=f"{st.session_state.selected_match['name'].replace(' ', '_')}_give_value.md",
+                    mime="text/markdown",
+                    use_container_width=True,
+                    key="dl_give_md"
+                )
+            with tab2:
+                st.text_area("Slack/Text Version:", value=st.session_state.slack_recommendations_give, height=400)
+                st.download_button(
+                    label="⬇️ Download Slack Version",
+                    data=st.session_state.slack_recommendations_give,
+                    file_name=f"{st.session_state.selected_match['name'].replace(' ', '_')}_give_value.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                    key="dl_give_slack"
+                )
 
         # Reset button
         st.divider()
@@ -328,13 +395,17 @@ def main():
             st.session_state.search_performed = False
             st.session_state.matches = []
             st.session_state.selected_match = None
-            st.session_state.recommendations = None
-            st.session_state.slack_recommendations = None
+            st.session_state.recommendations_get = None
+            st.session_state.slack_recommendations_get = None
+            st.session_state.recommendations_give = None
+            st.session_state.slack_recommendations_give = None
+            st.session_state.scoring_status_get = None
+            st.session_state.scoring_status_give = None
             st.rerun()
 
     # Footer
     st.divider()
-    st.caption("Powered by Gemini 2.5 Pro | EA Global Meeting Matcher")
+    st.caption("Powered by Gemini 3 Pro Preview | EA Global Meeting Matcher")
 
 
 if __name__ == "__main__":

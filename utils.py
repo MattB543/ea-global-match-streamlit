@@ -1,10 +1,11 @@
 """
 File: utils.py
 Purpose: Reusable functions for EA Global meeting matcher (Streamlit version)
-Extracted from match_person.py
 """
 
+import json
 import os
+import re
 import asyncio
 import pandas as pd
 from datetime import datetime
@@ -40,62 +41,21 @@ def load_csv_from_url(csv_url):
     return df, f"Downloaded {len(df)} attendees from Google Sheets"
 
 
-def load_csv(csv_path, csv_url):
+def filter_profiles(df, min_chars=300):
     """
-    Load the CSV with proper skiprows.
+    Filter profiles to keep only those with >= min_chars total characters.
 
     Args:
-        csv_path: Local CSV file path
-        csv_url: Google Sheets export URL
-
-    Returns:
-        DataFrame with attendees
-    """
-    # Check if local CSV exists
-    if os.path.exists(csv_path):
-        df = pd.read_csv(csv_path, skiprows=4)
-        return df, f"Loaded {len(df)} attendees from local file"
-
-    # Download if not found locally
-    export_url = get_export_url(csv_url)
-    df = pd.read_csv(export_url, skiprows=4)
-
-    # Save for next time
-    df_with_header = pd.read_csv(export_url)
-    df_with_header.to_csv(csv_path, index=False)
-
-    return df, f"Downloaded and saved {len(df)} attendees from Google Sheets"
-
-
-def generate_output_md_content(csv_url, min_chars=300):
-    """
-    Generate output.md content dynamically from CSV URL.
-    Filters rows to keep only those with >= min_chars total characters.
-
-    Args:
-        csv_url: Google Sheets URL
+        df: DataFrame with attendee data
         min_chars: Minimum character count to include row (default 300)
 
     Returns:
-        Tuple of (markdown_content, original_count, filtered_count)
+        Tuple of (filtered_df, original_count, filtered_count)
     """
-    # Download CSV
-    export_url = get_export_url(csv_url) if '/d/' in csv_url else csv_url
-    df = pd.read_csv(export_url, skiprows=4)
     original_count = len(df)
-
-    # Filter rows by character length
-    df['_row_length'] = df.apply(calculate_row_length, axis=1)
-    df_filtered = df[df['_row_length'] >= min_chars].drop('_row_length', axis=1)
-    filtered_count = len(df_filtered)
-
-    # Convert to pipe-delimited markdown
-    import io
-    output = io.StringIO()
-    df_filtered.to_csv(output, sep='|', index=False)
-    content = output.getvalue()
-
-    return content, original_count, filtered_count
+    row_lengths = df.apply(calculate_row_length, axis=1)
+    df_filtered = df[row_lengths >= min_chars]
+    return df_filtered, original_count, len(df_filtered)
 
 
 def find_matches(df, name, limit=5):
@@ -110,13 +70,8 @@ def find_matches(df, name, limit=5):
     Returns:
         List of tuples: [(matched_name, score, idx), ...]
     """
-    # Create full names for matching
-    df['full_name'] = df['First Name'].fillna('') + ' ' + df['Last Name'].fillna('')
-    full_names = df['full_name'].tolist()
-
-    # Fuzzy match
+    full_names = (df['First Name'].fillna('') + ' ' + df['Last Name'].fillna('')).tolist()
     matches = process.extract(name, full_names, scorer=fuzz.ratio, limit=limit)
-
     return matches if matches else []
 
 
@@ -125,8 +80,17 @@ def format_row_as_pipe_delimited(row):
     return '|'.join(str(val) if pd.notna(val) else '' for val in row.values)
 
 
+def format_profile_for_llm(row):
+    """Format a DataFrame row as a labeled JSON object for LLM consumption."""
+    profile = {}
+    for col, val in row.items():
+        if pd.notna(val) and str(val).strip():
+            profile[col] = str(val).strip()
+    return json.dumps(profile, ensure_ascii=False)
+
+
 def format_profile_display(row):
-    """Format a DataFrame row for nice display."""
+    """Format a DataFrame row for nice display in Streamlit."""
     fields = []
     for col, val in row.items():
         if pd.notna(val) and str(val).strip():
@@ -134,120 +98,301 @@ def format_profile_display(row):
     return "\n\n".join(fields)
 
 
-def load_output_md(output_md_path):
-    """Load the full output.md file."""
-    if not os.path.exists(output_md_path):
-        raise FileNotFoundError(f"{output_md_path} not found. Please upload or ensure it exists.")
+DIRECTION_SCORING = {
+    "get_value": {
+        "heading": "Score each person on how valuable a 1-on-1 meeting with them would be FOR ME.",
+        "criteria": """Consider:
+- How much I could learn from their expertise and experience
+- Potential for collaboration on projects aligned with MY goals
+- Access to their network, resources, or opportunities relevant to me
+- Alignment between their work/interests and what I'm trying to achieve""",
+    },
+    "give_value": {
+        "heading": "Score each person on how much VALUE I COULD PROVIDE TO THEM in a 1-on-1 meeting.",
+        "criteria": """Consider:
+- Their stated needs (especially "How Others Can Help Me") and whether my skills address them
+- Whether my expertise, experience, or network could advance THEIR goals
+- How my background uniquely positions me to help them specifically
+- Alignment between what I offer and what they're seeking""",
+    },
+}
 
-    with open(output_md_path, 'r', encoding='utf-8', errors='replace') as f:
-        return f.read()
+DIRECTION_FINAL = {
+    "get_value": {
+        "goal": "recommend the TOP 25 people I should prioritize meeting FOR MY OWN BENEFIT",
+        "per_person": """1. Their name, title, and organization
+2. What I stand to gain from this meeting (specific knowledge, collaboration, opportunities)
+3. Concrete topics to discuss that would be most valuable FOR ME""",
+    },
+    "give_value": {
+        "goal": "recommend the TOP 25 people I should prioritize meeting TO PROVIDE THEM THE MOST VALUE",
+        "per_person": """1. Their name, title, and organization
+2. What specific value I can provide to them based on their needs and my capabilities
+3. Concrete ways I could help them or topics where my expertise would benefit them""",
+    },
+}
 
 
-def create_prompt(full_name, user_row, full_output, additional_context=None):
-    """Create the prompt following claude/format.md structure."""
-    profile_section = user_row
+def create_scoring_prompt(user_profile, numbered_profiles, batch_size, total_count, direction="get_value"):
+    """Create the scoring prompt for a batch of profiles."""
+    d = DIRECTION_SCORING[direction]
+
+    return f"""You are helping match attendees at EA Global, a conference for people in the Effective Altruism community.
+
+Below is MY profile, followed by a batch of {batch_size} attendee profiles (out of ~{total_count} total attendees at the conference).
+
+{d["heading"]}
+
+{d["criteria"]}
+
+IMPORTANT SCORING CONTEXT:
+- You are seeing {batch_size} of ~{total_count} total attendees. Do NOT force a bell curve or distribution within this batch.
+- Score each person INDEPENDENTLY based on match quality.
+- It is completely valid for many or all people in a batch to score high (or low).
+- A score of 10 does not mean "best in this batch" — it means "exceptional match regardless of who else exists."
+
+SCORING SCALE:
+- 9-10: Exceptional match for the criteria above
+- 7-8: Strong match
+- 5-6: Moderate match
+- 3-4: Mild match
+- 1-2: Weak match
+
+MY PROFILE:
+{user_profile}
+
+---
+
+ATTENDEE PROFILES TO SCORE:
+
+{numbered_profiles}
+
+---
+
+Return a JSON object mapping each profile number to its integer score.
+Example: {{"1": 7, "2": 9, "3": 4}}
+Score all {batch_size} profiles. Return ONLY valid JSON, nothing else."""
+
+
+def create_final_prompt(user_name, user_profile, scored_profiles_text, top_count, total_count,
+                        direction="get_value", additional_context=None):
+    """Create the final recommendation prompt for top-scored profiles."""
+    d = DIRECTION_FINAL[direction]
+    context_section = ""
     if additional_context:
-        profile_section = f"{user_row}\n\nAdditional context:\n{additional_context}"
+        context_section = f"\nAdditional context about me:\n{additional_context}\n"
 
-    return f"""My name is {full_name}, I'll share my EA Global profile below. Please carefully read all of the other EA Global profiles below and tell me which 10 people I should book a meeting with given my details and my requests and everyone elses details and offers.
+    return f"""You are helping me ({user_name}) decide who to meet at EA Global. I pre-screened ~{total_count} attendees using AI-assisted scoring and narrowed it down to the {top_count} strongest matches below (all scored 8+ out of 10).
 
-{profile_section}
+Your job: {d["goal"]}, with compelling explanations for each.
+
+MY PROFILE:
+{user_profile}
+{context_section}
+---
+
+TOP MATCHED PROFILES (with their pre-screening scores):
+{scored_profiles_text}
 
 ---
 
-{full_output}
+For each of your top 25 recommendations, include:
+{d["per_person"]}
 
----
-
-Remember, this is me:
-
-{profile_section}
-"""
+Rank from #1 (strongest) to #25. Start directly with the recommendations, no preamble or introduction."""
 
 
-async def send_to_gemini_parallel(prompt, api_key, model="gemini-2.5-pro"):
+async def run_matching_pipeline(df_filtered, user_name, user_profile, api_key, model,
+                                chunk_size=50, min_score=8, additional_context=None,
+                                direction="get_value", user_idx=None, semaphore=None):
     """
-    Send prompt to Gemini with 3 different temperatures in parallel,
-    then consolidate into one final response.
+    Run the matching pipeline for a single direction:
+    1. Score all profiles in batches (in parallel, rate-limited)
+    2. Filter to profiles scoring >= min_score
+    3. Generate final top-25 recommendations
 
-    Temperatures used: 0 (deterministic), 0.75 (balanced), 1.5 (creative)
+    Args:
+        direction: "get_value" (who benefits me) or "give_value" (who I can help)
+        user_idx: DataFrame index of the user's own profile to exclude from scoring
+        semaphore: asyncio.Semaphore for rate limiting API calls (shared across pipelines)
 
     Returns:
-        Tuple of (final_response, status_messages)
+        Tuple of (recommendations_text, all_scores_dict, status_messages)
     """
     client = genai.Client(api_key=api_key)
-    temps = [0, 0.75, 1.5]
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(10)
     status_messages = []
+    direction_label = "GET value" if direction == "get_value" else "GIVE value"
+    status_messages.append(f"=== {direction_label} ===")
 
-    async def call_with_temp(temp):
-        """Make a single API call with specified temperature."""
-        response = await client.aio.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=temp)
+    # Filter out the user's own profile
+    indices = df_filtered.index.tolist()
+    if user_idx is not None and user_idx in indices:
+        indices = [i for i in indices if i != user_idx]
+        status_messages.append(f"Excluded own profile (index {user_idx})")
+
+    total_count = len(indices)
+
+    # Create batches
+    batches = []
+    for i in range(0, len(indices), chunk_size):
+        batches.append(indices[i:i + chunk_size])
+
+    num_batches = len(batches)
+    status_messages.append(f"Scoring {total_count} profiles in {num_batches} batches of ~{chunk_size}...")
+
+    async def score_one_batch(batch_indices, batch_num):
+        """Score a single batch of profiles with retries on failure."""
+        numbered_lines = []
+        for j, idx in enumerate(batch_indices, 1):
+            row = df_filtered.loc[idx]
+            profile_json = format_profile_for_llm(row)
+            numbered_lines.append(f"Profile {j}: {profile_json}")
+
+        numbered_text = "\n".join(numbered_lines)
+        prompt = create_scoring_prompt(
+            user_profile, numbered_text, len(batch_indices), total_count, direction
         )
-        return response.text
 
-    # Make 3 parallel calls
-    status_messages.append(f"Making 3 parallel calls (temps: {temps})...")
+        backoff_delays = [5, 10, 20]
+        for attempt in range(3):
+            async with semaphore:
+                try:
+                    response = await client.aio.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=1,
+                            response_mime_type="application/json"
+                        )
+                    )
+
+                    if not response.text:
+                        raise ValueError(f"Empty response for batch {batch_num}")
+
+                    scores = json.loads(response.text)
+
+                    # Map profile numbers back to df indices
+                    result = {}
+                    for j, idx in enumerate(batch_indices, 1):
+                        score = scores.get(str(j), scores.get(j, 0))
+                        result[idx] = score
+
+                    return result, batch_num
+
+                except Exception as e:
+                    if attempt < 2:
+                        await asyncio.sleep(backoff_delays[attempt])
+                    else:
+                        raise ValueError(f"Batch {batch_num} failed after {attempt + 1} attempts: {e}")
+
+    # Run all batches in parallel
     try:
-        results = await asyncio.gather(*[call_with_temp(t) for t in temps])
-        status_messages.append("✓ Received all 3 responses")
+        results = await asyncio.gather(*[score_one_batch(b, i + 1) for i, b in enumerate(batches)])
+        status_messages.append(f"All {num_batches} batches scored")
     except Exception as e:
-        status_messages.append(f"✗ Failed during parallel calls: {e}")
+        status_messages.append(f"Scoring failed: {e}")
         raise
 
-    # Create consolidation prompt
-    consolidation_prompt = f"""Below are three lists of recommended EA Global meeting matches. Merge them into a single list by:
-1. Removing duplicate names (same person should appear only once)
-2. Selecting the best 10 unique people
-3. Using the EXACT same format and structure as the lists below
-(for each match, include their title and org if available, and include why the match is a good fit for the user)
-4. No preamble or introduction - start directly with the recommendations
+    # Collect all scores
+    all_scores = {}
+    for batch_scores, _ in results:
+        all_scores.update(batch_scores)
 
-List 1:
-{results[0]}
+    # Score distribution stats
+    for score_val in range(10, 0, -1):
+        count = sum(1 for s in all_scores.values() if s == score_val)
+        if count > 0:
+            status_messages.append(f"  Score {score_val}: {count} profiles")
 
----
+    # Filter to min_score+
+    top_items = [
+        (idx, score) for idx, score
+        in sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
+        if score >= min_score
+    ]
+    status_messages.append(f"{len(top_items)} profiles scored {min_score}+ (sending to final round)")
 
-List 2:
-{results[1]}
+    if not top_items:
+        raise ValueError(f"No profiles scored {min_score}+. Try lowering the threshold.")
 
----
+    # Format top profiles with their scores for the final prompt
+    scored_lines = []
+    for idx, score in top_items:
+        row = df_filtered.loc[idx]
+        profile_json = format_profile_for_llm(row)
+        scored_lines.append(f"[Score: {score}] {profile_json}")
+    scored_text = "\n".join(scored_lines)
 
-List 3:
-{results[2]}
+    # Final recommendation call
+    status_messages.append(f"Generating final top 25 from {len(top_items)} candidates...")
+    final_prompt = create_final_prompt(
+        user_name, user_profile, scored_text, len(top_items),
+        total_count, direction, additional_context
+    )
 
----
+    backoff_delays = [5, 10, 20]
+    for attempt in range(3):
+        async with semaphore:
+            try:
+                final_response = await client.aio.models.generate_content(
+                    model=model,
+                    contents=final_prompt,
+                    config=types.GenerateContentConfig(temperature=1)
+                )
+                if not final_response.text:
+                    raise ValueError("Empty response from final recommendation call")
+                status_messages.append("Final recommendations generated")
+                return final_response.text, all_scores, status_messages
+            except Exception as e:
+                if attempt < 2:
+                    status_messages.append(f"Final call failed, retrying in {backoff_delays[attempt]}s...")
+                    await asyncio.sleep(backoff_delays[attempt])
+                else:
+                    status_messages.append(f"Final recommendation failed: {e}")
+                    raise
 
-Output the consolidated top 10 unique recommendations now, using the exact format above:"""
 
-    # Make final consolidation call (use temp=0 for consistency)
-    status_messages.append("Consolidating 3 responses into final output...")
-    try:
-        final_response = await client.aio.models.generate_content(
-            model=model,
-            contents=consolidation_prompt,
-            config=types.GenerateContentConfig(temperature=0)
-        )
-        status_messages.append("✓ Consolidation complete")
-        return final_response.text, status_messages
-    except Exception as e:
-        status_messages.append(f"✗ Failed during consolidation: {e}")
-        raise
+async def run_dual_matching_pipeline(df_filtered, user_name, user_profile, api_key, model,
+                                     chunk_size=50, min_score=8, additional_context=None,
+                                     user_idx=None):
+    """
+    Run both get_value and give_value pipelines in parallel.
+
+    Returns:
+        Tuple of (get_result, give_result)
+        where each result is (recommendations_text, all_scores_dict, status_messages)
+    """
+    # Shared semaphore to stay under Gemini's 25 RPM rate limit
+    semaphore = asyncio.Semaphore(10)
+
+    get_task = run_matching_pipeline(
+        df_filtered, user_name, user_profile, api_key, model,
+        chunk_size=chunk_size, min_score=min_score, additional_context=additional_context,
+        direction="get_value", user_idx=user_idx, semaphore=semaphore
+    )
+    give_task = run_matching_pipeline(
+        df_filtered, user_name, user_profile, api_key, model,
+        chunk_size=chunk_size, min_score=min_score, additional_context=additional_context,
+        direction="give_value", user_idx=user_idx, semaphore=semaphore
+    )
+    return await asyncio.gather(get_task, give_task)
 
 
-def save_output(full_name, content, output_dir):
+def save_output(full_name, content, output_dir, suffix=""):
     """
     Save the output to timestamped .md and .txt (Slack format) files.
+
+    Args:
+        suffix: Optional suffix for filename (e.g., "_get_value")
 
     Returns:
         Tuple of (md_filepath, txt_filepath)
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # Clean name for filename
-    clean_name = full_name.lower().replace(' ', '_')
-    base_filename = f"{timestamp}_{clean_name}_recommendations"
+    clean_name = re.sub(r'[^\w]', '_', full_name.lower())
+    base_filename = f"{timestamp}_{clean_name}_recommendations{suffix}"
 
     # Save markdown version
     md_filepath = os.path.join(output_dir, f"{base_filename}.md")
