@@ -50,3 +50,47 @@
 22:19:16 [GET value] Got response. Finish reason: stop
 22:19:16 [GET value] Usage: CompletionUsage(completion_tokens=2967, prompt_tokens=112378, total_tokens=115345, completion_tokens_details=CompletionTokensDetails(accepted_prediction_tokens=0, audio_tokens=0, reasoning_tokens=0, rejected_prediction_tokens=0), prompt_tokens_details=PromptTokensDetails(audio_tokens=0, cached_tokens=0))
 22:19:16 [GET value] Success! Response length: 14338 chars
+22:26:45 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:47 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:48 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:48 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:49 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:49 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:49 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:49 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:49 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:49 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:49 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:49 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:49 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:50 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:50 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:50 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:50 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:50 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:50 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:50 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:50 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:50 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:51 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:51 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:51 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:51 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:51 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:51 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:52 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:52 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:52 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:52 [GIVE value] Final prompt length: 104094 chars, 40 candidates
+22:26:52 [GIVE value] Final call attempt 1/3 — sending to Azure...
+22:26:53 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:26:53 [GET value] Final prompt length: 203265 chars, 100 candidates
+22:26:53 [GET value] Final call attempt 1/3 — sending to Azure...
+22:28:29 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:28:29 [GET value] Got response. Finish reason: stop
+22:28:29 [GET value] Usage: CompletionUsage(completion_tokens=3053, prompt_tokens=47048, total_tokens=50101, completion_tokens_details=CompletionTokensDetails(accepted_prediction_tokens=0, audio_tokens=0, reasoning_tokens=0, rejected_prediction_tokens=0), prompt_tokens_details=PromptTokensDetails(audio_tokens=0, cached_tokens=0))
+22:28:29 [GET value] Success! Response length: 14596 chars
+22:28:32 HTTP Request: POST https://batch-ai.openai.azure.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+22:28:32 [GIVE value] Got response. Finish reason: stop
+22:28:32 [GIVE value] Usage: CompletionUsage(completion_tokens=3396, prompt_tokens=23389, total_tokens=26785, completion_tokens_details=CompletionTokensDetails(accepted_prediction_tokens=0, audio_tokens=0, reasoning_tokens=0, rejected_prediction_tokens=0), prompt_tokens_details=PromptTokensDetails(audio_tokens=0, cached_tokens=0))
+22:28:32 [GIVE value] Success! Response length: 16697 chars
