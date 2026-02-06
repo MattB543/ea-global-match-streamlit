@@ -8,8 +8,11 @@ import hmac
 import os
 import asyncio
 import re
+import time
 import streamlit as st
 import pandas as pd
+
+from rapidfuzz import fuzz
 
 from utils import (
     load_csv_from_url,
@@ -21,6 +24,55 @@ from utils import (
     run_dual_matching_pipeline,
     save_output,
 )
+
+
+def build_swapcard_lookup(df):
+    """Build a name -> Swapcard URL lookup from the DataFrame."""
+    lookup = {}
+    for _, row in df.iterrows():
+        first = str(row.get('First Name', '')).strip()
+        last = str(row.get('Last Name', '')).strip()
+        url = str(row.get('Swapcard', '')).strip()
+        if first and last and url and url.startswith('http'):
+            full_name = f"{first} {last}"
+            lookup[full_name.lower()] = url
+    return lookup
+
+
+def inject_swapcard_links(markdown_text, swapcard_lookup):
+    """Replace names in ### headings with clickable Swapcard links."""
+    def replace_heading(match):
+        full_line = match.group(0)
+        prefix = match.group(1)  # "### #1. "
+        name = match.group(2)    # "First Last"
+        rest = match.group(3)    # " — Role, Org"
+
+        # Fuzzy match the name against the lookup
+        name_lower = name.strip().lower()
+        if name_lower in swapcard_lookup:
+            url = swapcard_lookup[name_lower]
+            return f"{prefix}[{name}]({url}){rest}"
+
+        # Try fuzzy matching for slight name variations
+        best_match = None
+        best_score = 0
+        for lookup_name, url in swapcard_lookup.items():
+            score = fuzz.ratio(name_lower, lookup_name)
+            if score > best_score:
+                best_score = score
+                best_match = (lookup_name, url)
+        if best_match and best_score >= 80:
+            url = best_match[1]
+            return f"{prefix}[{name}]({url}){rest}"
+
+        return full_line
+
+    # Match "### #1. Name — Rest" or "### #1. Name - Rest"
+    return re.sub(
+        r'(###\s*#?\d+\.?\s*)([^—–\-\n]+)([\s]*[—–-].+)',
+        replace_heading,
+        markdown_text
+    )
 
 # Page config - mobile-friendly
 st.set_page_config(
@@ -35,13 +87,14 @@ st.markdown("""
 <style>
     .block-container { max-width: 1100px; }
     .stMarkdown p { white-space: pre-wrap; }
+    .stMarkdown h3 { font-size: 1.3rem; margin-top: 2.2rem; margin-bottom: 0.3rem; }
+    .stMarkdown h4 { font-size: 1.15rem; margin-top: 1.8rem; margin-bottom: 0.3rem; }
+    .stMarkdown hr { border: none; border-top: 1px solid rgba(128, 128, 128, 0.2); margin: 1.5rem 0; }
 </style>
 """, unsafe_allow_html=True)
 
 # Configuration
 OUTPUT_DIR = "outputs/matches"
-# Gemini 3 Pro Preview just launched - upgrading from gemini-2.5-pro
-LLM_MODEL = "gemini-3-pro-preview"
 
 # Ensure output directory exists
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -49,16 +102,20 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def get_config():
     """Get configuration from secrets or environment."""
-    try:
-        csv_url = st.secrets.get("CSV_URL", "")
-        app_password = st.secrets.get("APP_PASSWORD", "")
-        gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
-    except Exception:
-        csv_url = os.environ.get("CSV_URL", "")
-        app_password = os.environ.get("APP_PASSWORD", "")
-        gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
+    def _get(key, default=""):
+        try:
+            return st.secrets.get(key, default)
+        except Exception:
+            return os.environ.get(key, default)
 
-    return csv_url, app_password, gemini_api_key
+    return {
+        "csv_url": _get("CSV_URL"),
+        "app_password": _get("APP_PASSWORD"),
+        "azure_api_key": _get("AZURE_API_KEY"),
+        "azure_endpoint": _get("AZURE_OPENAI_ENDPOINT"),
+        "azure_deployment": _get("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2"),
+        "azure_api_version": _get("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
+    }
 
 # Initialize session state
 if 'authenticated' not in st.session_state:
@@ -75,23 +132,19 @@ if 'df_filtered' not in st.session_state:
     st.session_state.df_filtered = None
 if 'recommendations_get' not in st.session_state:
     st.session_state.recommendations_get = None
-if 'slack_recommendations_get' not in st.session_state:
-    st.session_state.slack_recommendations_get = None
 if 'recommendations_give' not in st.session_state:
     st.session_state.recommendations_give = None
-if 'slack_recommendations_give' not in st.session_state:
-    st.session_state.slack_recommendations_give = None
 if 'scoring_status_get' not in st.session_state:
     st.session_state.scoring_status_get = None
 if 'scoring_status_give' not in st.session_state:
     st.session_state.scoring_status_give = None
 
 
-def check_password(csv_url, app_password, gemini_api_key):
+def check_password(config):
     """Show password input and check if correct."""
     # Check if all required configs are set
-    if not csv_url or not app_password or not gemini_api_key:
-        st.error("⚠️ Missing configuration. Please set CSV_URL, APP_PASSWORD, and GEMINI_API_KEY in secrets.")
+    if not config["csv_url"] or not config["app_password"] or not config["azure_api_key"] or not config["azure_endpoint"]:
+        st.error("⚠️ Missing configuration. Please set CSV_URL, APP_PASSWORD, AZURE_API_KEY, and AZURE_OPENAI_ENDPOINT in secrets.")
         st.stop()
 
     # Initialize failed attempts tracking
@@ -110,28 +163,33 @@ def check_password(csv_url, app_password, gemini_api_key):
 
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
-        if st.button("🔓 Unlock", use_container_width=True):
-            if hmac.compare_digest(password_input, app_password):
-                st.session_state.authenticated = True
-                st.session_state.failed_attempts = 0
-                st.rerun()
+        unlock_button = st.button("🔓 Unlock", use_container_width=True)
+
+    # Trigger on button click or Enter key (password value changed)
+    password_submitted = password_input and password_input != st.session_state.get('last_password_attempt', '')
+    if (unlock_button or password_submitted) and password_input:
+        st.session_state.last_password_attempt = password_input
+        if hmac.compare_digest(password_input, config["app_password"]):
+            st.session_state.authenticated = True
+            st.session_state.failed_attempts = 0
+            st.rerun()
+        else:
+            st.session_state.failed_attempts += 1
+            if st.session_state.failed_attempts >= 5:
+                st.error(f"❌ Incorrect password. Too many attempts — please wait before retrying.")
             else:
-                st.session_state.failed_attempts += 1
-                if st.session_state.failed_attempts >= 5:
-                    st.error(f"❌ Incorrect password. Too many attempts — please wait before retrying.")
-                else:
-                    st.error(f"❌ Incorrect password ({5 - st.session_state.failed_attempts} attempts remaining)")
+                st.error(f"❌ Incorrect password ({5 - st.session_state.failed_attempts} attempts remaining)")
 
     st.stop()
 
 
 def main():
     # Get configuration
-    csv_url, app_password, api_key = get_config()
+    config = get_config()
 
     # Check password first
     if not st.session_state.authenticated:
-        check_password(csv_url, app_password, api_key)
+        check_password(config)
 
     st.title("🤝 EA Global Meeting Matcher")
     st.markdown("Find the best people to meet at EA Global based on your profile")
@@ -140,7 +198,7 @@ def main():
     if st.session_state.df is None:
         with st.spinner("📥 Downloading latest attendee data from Google Sheets..."):
             try:
-                st.session_state.df, load_msg = load_csv_from_url(csv_url)
+                st.session_state.df, load_msg = load_csv_from_url(config["csv_url"])
                 st.success(load_msg)
             except Exception as e:
                 st.error(f"Failed to load CSV: {e}")
@@ -150,11 +208,12 @@ def main():
 
     # Filter profiles (cached in session state)
     if st.session_state.df_filtered is None:
-        with st.spinner("🔄 Filtering profiles (>= 300 chars)..."):
+        with st.spinner("🔄 Filtering incomplete profiles..."):
             try:
-                df_filtered, original_count, filtered_count = filter_profiles(df, min_chars=300)
+                df_filtered, original_count, filtered_count = filter_profiles(df, min_chars=200)
                 st.session_state.df_filtered = df_filtered
-                st.success(f"Filtered profiles: {filtered_count} of {original_count} attendees")
+                excluded = original_count - filtered_count
+                st.success(f"Scoring {filtered_count} of {original_count} attendees ({excluded} excluded for having fewer than 200 characters of profile info)")
             except Exception as e:
                 st.error(f"Failed to filter profiles: {e}")
                 st.stop()
@@ -175,7 +234,10 @@ def main():
         st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
         search_button = st.button("🔍 Search", type="primary", use_container_width=True)
 
-    if search_button and name:
+    # Trigger search on button click OR when name changes (Enter key submits the text_input)
+    name_changed = name and name != st.session_state.get('last_searched_name', '')
+    if (search_button or name_changed) and name:
+        st.session_state.last_searched_name = name
         with st.spinner(f"Searching for '{name}'..."):
             matches = find_matches(df, name, limit=5)
             if matches:
@@ -280,129 +342,227 @@ def main():
             if match_data['type'] == 'csv':
                 user_idx = match_data['idx']
 
-            # Run dual matching pipeline
+            # Run dual matching pipeline with progress tracking
             status_container = st.empty()
-            with st.spinner("Running dual matching pipeline (This might take a few mins, we are doing multiple rounds of scoring)..."):
-                try:
-                    (get_result, give_result) = asyncio.run(
-                        run_dual_matching_pipeline(
-                            df_filtered,
-                            match_data['name'],
-                            user_profile,
-                            api_key,
-                            LLM_MODEL,
-                            chunk_size=50,
-                            min_score=8,
-                            additional_context=additional_context.strip() if additional_context.strip() else None,
-                            user_idx=user_idx
-                        )
+            progress_bar = st.progress(0)
+            progress_text = st.empty()
+
+            # Calculate total batches for progress tracking
+            import math
+            num_profiles = len(df_filtered) - (1 if user_idx is not None else 0)
+            batches_per_direction = math.ceil(num_profiles / 60)
+            total_batches = batches_per_direction * 2  # both directions
+
+            progress_state = {"completed": 0, "start_time": time.time(), "generating_finals": False}
+            FINAL_REPORT_SECONDS = 120  # estimated time for final report generation
+
+            # Show initial state immediately
+            progress_text.caption(f"Scored 0/{total_batches} batches across both pipelines — ~1m 30s remaining")
+
+            def on_batch_complete(completed_in_direction, total_in_direction, direction):
+                # Don't overwrite the "generating final reports" message
+                if progress_state["generating_finals"]:
+                    return
+                progress_state["completed"] += 1
+                done = progress_state["completed"]
+                elapsed = time.time() - progress_state["start_time"]
+                # Reserve last 10% of bar for final report generation
+                pct = min(done / total_batches * 0.9, 0.9)
+                progress_bar.progress(pct)
+
+                if done >= 3:
+                    avg_per_batch = elapsed / done
+                    remaining = (total_batches - done) * avg_per_batch + FINAL_REPORT_SECONDS
+                    mins, secs = divmod(int(remaining), 60)
+                    eta = f"{mins}m {secs}s" if mins else f"{secs}s"
+                else:
+                    # Use 1m30s estimate until we have enough data
+                    remaining = max(0, 90 - elapsed)
+                    mins, secs = divmod(int(remaining), 60)
+                    eta = f"{mins}m {secs}s" if mins else f"{secs}s"
+                progress_text.caption(f"Scored {done}/{total_batches} batches across both pipelines — ~{eta} remaining")
+
+            def on_final_start(direction):
+                progress_state["generating_finals"] = True
+                progress_bar.progress(0.92)
+                progress_text.caption("Scoring complete! Generating final reports — ~2m remaining")
+
+            try:
+                (get_result, give_result) = asyncio.run(
+                    run_dual_matching_pipeline(
+                        df_filtered,
+                        match_data['name'],
+                        user_profile,
+                        azure_api_key=config["azure_api_key"],
+                        azure_endpoint=config["azure_endpoint"],
+                        azure_deployment=config["azure_deployment"],
+                        azure_api_version=config["azure_api_version"],
+                        chunk_size=60,
+                        min_score=8,
+                        additional_context=additional_context.strip() if additional_context.strip() else None,
+                        user_idx=user_idx,
+                        progress_callback=on_batch_complete,
+                        final_callback=on_final_start
                     )
+                )
 
-                    get_response, get_scores, get_status = get_result
-                    give_response, give_scores, give_status = give_result
+                progress_bar.progress(1.0)
+                progress_text.caption("Done!")
 
-                    # Show scoring details as bar charts
-                    def parse_score_distribution(status_msgs):
-                        dist = {}
-                        for msg in status_msgs:
-                            m = re.match(r'\s*Score (\d+): (\d+) profiles', msg)
-                            if m:
-                                dist[int(m.group(1))] = int(m.group(2))
-                        return dist
+                get_response, get_scores, get_status = get_result
+                give_response, give_scores, give_status = give_result
 
-                    get_dist = parse_score_distribution(get_status)
-                    give_dist = parse_score_distribution(give_status)
+                # Inject Swapcard links into names
+                swapcard_lookup = build_swapcard_lookup(df)
+                get_response = inject_swapcard_links(get_response, swapcard_lookup)
+                give_response = inject_swapcard_links(give_response, swapcard_lookup)
 
-                    with status_container.expander("📊 Scoring details", expanded=True):
-                        chart_col1, chart_col2 = st.columns(2)
-                        with chart_col1:
-                            st.caption("🎯 Get Value (for you)")
-                            if get_dist:
-                                chart_df = pd.DataFrame({
-                                    "Score": range(1, 11),
-                                    "Profiles": [get_dist.get(i, 0) for i in range(1, 11)]
-                                }).set_index("Score")
-                                st.bar_chart(chart_df)
-                        with chart_col2:
-                            st.caption("🎁 Give Value (for them)")
-                            if give_dist:
-                                chart_df = pd.DataFrame({
-                                    "Score": range(1, 11),
-                                    "Profiles": [give_dist.get(i, 0) for i in range(1, 11)]
-                                }).set_index("Score")
-                                st.bar_chart(chart_df)
+                # Clear progress indicators
+                progress_bar.empty()
+                progress_text.empty()
 
-                    # Save get_value results
-                    md_path, txt_path = save_output(match_data['name'], get_response, OUTPUT_DIR, suffix="_get_value")
-                    with open(txt_path, 'r', encoding='utf-8') as f:
-                        st.session_state.slack_recommendations_get = f.read()
-                    st.session_state.recommendations_get = get_response
-                    st.session_state.scoring_status_get = get_status
+                # Show scoring details as bar charts
+                def parse_score_distribution(status_msgs):
+                    dist = {}
+                    for msg in status_msgs:
+                        m = re.match(r'\s*Score (\d+): (\d+) profiles', msg)
+                        if m:
+                            dist[int(m.group(1))] = int(m.group(2))
+                    return dist
 
-                    # Save give_value results
-                    md_path, txt_path = save_output(match_data['name'], give_response, OUTPUT_DIR, suffix="_give_value")
-                    with open(txt_path, 'r', encoding='utf-8') as f:
-                        st.session_state.slack_recommendations_give = f.read()
-                    st.session_state.recommendations_give = give_response
-                    st.session_state.scoring_status_give = give_status
+                get_dist = parse_score_distribution(get_status)
+                give_dist = parse_score_distribution(give_status)
 
-                    st.success("✅ Recommendations generated successfully!")
+                with status_container.expander("📊 Scoring details", expanded=True):
+                    chart_col1, chart_col2 = st.columns(2)
+                    with chart_col1:
+                        st.caption("🎯 Get Value (for you)")
+                        if get_dist:
+                            chart_df = pd.DataFrame({
+                                "Score": range(1, 11),
+                                "Profiles": [get_dist.get(i, 0) for i in range(1, 11)]
+                            }).set_index("Score")
+                            st.bar_chart(chart_df)
+                    with chart_col2:
+                        st.caption("🎁 Give Value (for them)")
+                        if give_dist:
+                            chart_df = pd.DataFrame({
+                                "Score": range(1, 11),
+                                "Profiles": [give_dist.get(i, 0) for i in range(1, 11)]
+                            }).set_index("Score")
+                            st.bar_chart(chart_df)
 
-                except Exception as e:
-                    st.error(f"❌ Failed to generate recommendations: {e}")
-                    st.stop()
+                # Save results
+                save_output(match_data['name'], get_response, OUTPUT_DIR, suffix="_get_value")
+                save_output(match_data['name'], give_response, OUTPUT_DIR, suffix="_give_value")
+                st.session_state.recommendations_get = get_response
+                st.session_state.recommendations_give = give_response
+                st.session_state.scoring_status_get = get_status
+                st.session_state.scoring_status_give = give_status
+
+                st.success("✅ Recommendations generated successfully!")
+
+            except Exception as e:
+                st.error(f"❌ Failed to generate recommendations: {e}")
+                st.stop()
 
     # Step 5: Display results
     if st.session_state.recommendations_get:
         st.header("5️⃣ Your Meeting Recommendations")
 
-        main_tab1, main_tab2 = st.tabs(["🎯 Who to Meet FOR YOU", "🎁 Who to Meet TO HELP THEM"])
+        main_tab1, main_tab2, main_tab3 = st.tabs(["🎯 Who to Meet FOR YOU", "🎁 Who to Meet TO HELP THEM", "⭐ On Both Lists"])
 
         with main_tab1:
-            tab1, tab2 = st.tabs(["📝 Markdown", "📱 Slack Format"])
-            with tab1:
-                st.markdown(st.session_state.recommendations_get)
-                st.download_button(
-                    label="⬇️ Download Markdown Version",
-                    data=st.session_state.recommendations_get,
-                    file_name=f"{st.session_state.selected_match['name'].replace(' ', '_')}_get_value.md",
-                    mime="text/markdown",
-                    use_container_width=True,
-                    key="dl_get_md"
-                )
-            with tab2:
-                st.text_area("Slack/Text Version:", value=st.session_state.slack_recommendations_get, height=400)
-                st.download_button(
-                    label="⬇️ Download Slack Version",
-                    data=st.session_state.slack_recommendations_get,
-                    file_name=f"{st.session_state.selected_match['name'].replace(' ', '_')}_get_value.txt",
-                    mime="text/plain",
-                    use_container_width=True,
-                    key="dl_get_slack"
-                )
+            st.markdown(st.session_state.recommendations_get)
+            st.download_button(
+                label="⬇️ Download",
+                data=st.session_state.recommendations_get,
+                file_name=f"{st.session_state.selected_match['name'].replace(' ', '_')}_get_value.md",
+                mime="text/markdown",
+                use_container_width=True,
+                key="dl_get_md"
+            )
 
         with main_tab2:
-            tab1, tab2 = st.tabs(["📝 Markdown", "📱 Slack Format"])
-            with tab1:
-                st.markdown(st.session_state.recommendations_give)
-                st.download_button(
-                    label="⬇️ Download Markdown Version",
-                    data=st.session_state.recommendations_give,
-                    file_name=f"{st.session_state.selected_match['name'].replace(' ', '_')}_give_value.md",
-                    mime="text/markdown",
-                    use_container_width=True,
-                    key="dl_give_md"
-                )
-            with tab2:
-                st.text_area("Slack/Text Version:", value=st.session_state.slack_recommendations_give, height=400)
-                st.download_button(
-                    label="⬇️ Download Slack Version",
-                    data=st.session_state.slack_recommendations_give,
-                    file_name=f"{st.session_state.selected_match['name'].replace(' ', '_')}_give_value.txt",
-                    mime="text/plain",
-                    use_container_width=True,
-                    key="dl_give_slack"
-                )
+            st.markdown(st.session_state.recommendations_give)
+            st.download_button(
+                label="⬇️ Download",
+                data=st.session_state.recommendations_give,
+                file_name=f"{st.session_state.selected_match['name'].replace(' ', '_')}_give_value.md",
+                mime="text/markdown",
+                use_container_width=True,
+                key="dl_give_md"
+            )
+
+        with main_tab3:
+            # Parse names and their sections from both reports
+            def extract_entries(markdown_text):
+                """Extract name -> full entry section from structured report."""
+                entries = {}
+                if not markdown_text:
+                    return entries
+                # Split on ### headings
+                parts = re.split(r'(?=^### )', markdown_text, flags=re.MULTILINE)
+                for part in parts:
+                    part = part.strip()
+                    if not part.startswith('###'):
+                        continue
+                    heading_line = part.split('\n')[0]
+                    # Extract full heading after "### #1. "
+                    heading_match = re.match(r'###\s*#?\d+\.?\s*(.+)', heading_line)
+                    if heading_match:
+                        full_heading = heading_match.group(1).strip()
+                        # Get name: strip markdown link syntax [Name](url) if present
+                        name_part = re.split(r'\s*[—–]\s*', full_heading)[0].strip()
+                        link_match = re.match(r'\[([^\]]+)\]', name_part)
+                        name = link_match.group(1) if link_match else name_part
+                        # Get everything after the heading line
+                        body_lines = part.split('\n')[1:]
+                        body = '\n'.join(l for l in body_lines if l.strip() and l.strip() != '---')
+                        entries[name.lower()] = {
+                            'name': name,
+                            'heading': full_heading,
+                            'body': body.strip()
+                        }
+                return entries
+
+            get_entries = extract_entries(st.session_state.recommendations_get)
+            give_entries = extract_entries(st.session_state.recommendations_give)
+
+            # Find overlapping names (exact match on lowercase)
+            overlap_names = set(get_entries.keys()) & set(give_entries.keys())
+
+            # Also try fuzzy matching for near-matches
+            if len(overlap_names) < len(get_entries):
+                for get_key in get_entries:
+                    if get_key in overlap_names:
+                        continue
+                    for give_key in give_entries:
+                        if give_key in overlap_names:
+                            continue
+                        if fuzz.ratio(get_key, give_key) >= 85:
+                            overlap_names.add(get_key)
+                            # Store the give_key mapping
+                            get_entries[get_key]['_give_key'] = give_key
+                            break
+
+            if overlap_names:
+                st.success(f"**{len(overlap_names)} people appear on both lists** — these are your highest-priority meetings!")
+                st.markdown("")
+                for name_key in overlap_names:
+                    get_entry = get_entries[name_key]
+                    give_key = get_entry.get('_give_key', name_key)
+                    give_entry = give_entries.get(give_key, give_entries.get(name_key))
+                    if not give_entry:
+                        continue
+                    st.markdown(f"### {get_entry['heading']}")
+                    st.markdown(f"**🎯 Why meet them (for you):**")
+                    st.markdown(get_entry['body'])
+                    st.markdown(f"**🎁 Why meet them (for them):**")
+                    st.markdown(give_entry['body'])
+                    st.markdown("---")
+            else:
+                st.info("No overlapping names between the two lists. Each list recommends unique people.")
 
         # Reset button
         st.divider()
@@ -411,16 +571,15 @@ def main():
             st.session_state.matches = []
             st.session_state.selected_match = None
             st.session_state.recommendations_get = None
-            st.session_state.slack_recommendations_get = None
             st.session_state.recommendations_give = None
-            st.session_state.slack_recommendations_give = None
             st.session_state.scoring_status_get = None
             st.session_state.scoring_status_give = None
+            st.session_state.last_searched_name = ''
             st.rerun()
 
     # Footer
     st.divider()
-    st.caption("Powered by Gemini 3 Pro Preview | EA Global Meeting Matcher")
+    st.caption("Powered by Azure OpenAI | EA Global Meeting Matcher")
 
 
 if __name__ == "__main__":

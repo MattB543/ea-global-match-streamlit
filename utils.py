@@ -4,35 +4,24 @@ Purpose: Reusable functions for EA Global meeting matcher (Streamlit version)
 """
 
 import json
+import logging
 import os
 import re
 import asyncio
 import pandas as pd
 from datetime import datetime
-from google import genai
-from google.genai import types
+from openai import AsyncAzureOpenAI
+
+logging.basicConfig(
+    filename="pipeline.log",
+    level=logging.INFO,
+    format="%(asctime)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 from rapidfuzz import fuzz, process
 from markdown_to_mrkdwn import SlackMarkdownConverter
 
-
-class RateLimiter:
-    """Token-bucket rate limiter for API calls."""
-
-    def __init__(self, max_per_minute=25):
-        self.max_per_minute = max_per_minute
-        self.interval = 60.0 / max_per_minute  # seconds between requests
-        self._lock = asyncio.Lock()
-        self._last_request_time = 0.0
-
-    async def acquire(self):
-        """Wait until we can make the next request."""
-        async with self._lock:
-            import time
-            now = time.monotonic()
-            wait_time = self._last_request_time + self.interval - now
-            if wait_time > 0:
-                await asyncio.sleep(wait_time)
-            self._last_request_time = time.monotonic()
 
 
 def get_export_url(sheet_url):
@@ -122,33 +111,37 @@ DIRECTION_SCORING = {
     "get_value": {
         "heading": "Score each person on how valuable a 1-on-1 meeting with them would be FOR ME.",
         "criteria": """Consider:
-- How much I could learn from their expertise and experience
-- Potential for collaboration on projects aligned with MY goals
-- Access to their network, resources, or opportunities relevant to me
-- Alignment between their work/interests and what I'm trying to achieve""",
+- SPECIFIC overlap between their work and my goals — not just "they're senior so I should meet them"
+- Potential for genuine collaboration, not just a one-way info dump
+- Whether a 20-minute conversation would actually produce something actionable (intro, project idea, partnership)
+- Match on experience level and domain — a CEO/Director is only high-value if our work genuinely intersects
+
+DO NOT default to high scores for people just because they are senior, well-known, or at prestigious orgs.
+A mid-career person working on exactly my problem is MORE valuable than a famous director in a tangentially related area.""",
     },
     "give_value": {
         "heading": "Score each person on how much VALUE I COULD PROVIDE TO THEM in a 1-on-1 meeting.",
         "criteria": """Consider:
-- Their stated needs (especially "How Others Can Help Me") and whether my skills address them
-- Whether my expertise, experience, or network could advance THEIR goals
-- How my background uniquely positions me to help them specifically
-- Alignment between what I offer and what they're seeking""",
+- Their stated needs (especially "How Others Can Help Me") and whether my specific skills address them
+- Whether I have concrete, actionable help to offer — not just vague encouragement
+- How my background UNIQUELY positions me to help them (would they get the same value from anyone?)
+- Whether they'd actually benefit from my level of experience, or if they need someone more/less senior
+
+DO NOT default to high scores just because someone is junior or "could use advice."
+Only score high if I have genuinely specific, useful value to provide based on their stated needs.""",
     },
 }
 
 DIRECTION_FINAL = {
     "get_value": {
         "goal": "recommend the TOP 25 people I should prioritize meeting FOR MY OWN BENEFIT",
-        "per_person": """1. Their name, title, and organization
-2. What I stand to gain from this meeting (specific knowledge, collaboration, opportunities)
-3. Concrete topics to discuss that would be most valuable FOR ME""",
+        "why": "What I stand to gain from this meeting (specific knowledge, collaboration, opportunities)",
+        "topics": "Concrete topics to discuss that would be most valuable FOR ME",
     },
     "give_value": {
         "goal": "recommend the TOP 25 people I should prioritize meeting TO PROVIDE THEM THE MOST VALUE",
-        "per_person": """1. Their name, title, and organization
-2. What specific value I can provide to them based on their needs and my capabilities
-3. Concrete ways I could help them or topics where my expertise would benefit them""",
+        "why": "What specific value I can provide to them based on their needs and my capabilities",
+        "topics": "Concrete ways I could help them or topics where my expertise would benefit them",
     },
 }
 
@@ -166,17 +159,18 @@ Below is MY profile, followed by a batch of {batch_size} attendee profiles (out 
 {d["criteria"]}
 
 IMPORTANT SCORING CONTEXT:
-- You are seeing {batch_size} of ~{total_count} total attendees. Do NOT force a bell curve or distribution within this batch.
-- Score each person INDEPENDENTLY based on match quality.
-- It is completely valid for many or all people in a batch to score high (or low).
-- A score of 10 does not mean "best in this batch" — it means "exceptional match regardless of who else exists."
+- You are seeing {batch_size} of ~{total_count} total attendees. Score each person INDEPENDENTLY.
+- Be DISCERNING. At a conference of ~{total_count} people, only ~15-20% should score 8+. Most people are 4-6.
+- A score of 8+ means "I would regret NOT meeting this person." Reserve it for genuinely strong matches.
+- Seniority and prestige are NOT scoring criteria. Score based on specific, concrete value exchange.
 
-SCORING SCALE:
-- 9-10: Exceptional match for the criteria above
-- 7-8: Strong match
-- 5-6: Moderate match
-- 3-4: Mild match
-- 1-2: Weak match
+SCORING SCALE (be strict — most people should score 4-6):
+- 10: Once-in-a-conference match. Near-perfect alignment on goals, skills, and timing.
+- 9: Exceptional match. Clear, specific, mutual value with actionable next steps.
+- 8: Strong match. Meaningful overlap that would produce a concrete outcome.
+- 6-7: Decent match. Some relevant overlap but not a must-meet.
+- 4-5: Tangential. Loosely related work but no specific reason to prioritize.
+- 1-3: Weak or no relevant connection.
 
 MY PROFILE:
 {user_profile}
@@ -216,32 +210,47 @@ TOP MATCHED PROFILES (with their pre-screening scores):
 
 ---
 
-For each of your top 25 recommendations, include:
-{d["per_person"]}
+Rank your top 25 from #1 (strongest) to #25. You MUST use exactly this markdown format for every person — no deviations:
 
-Rank from #1 (strongest) to #25. Start directly with the recommendations, no preamble or introduction."""
+### #1. First Last — Role, Organization
+- **Why:** {d["why"]}
+- **Topics to discuss:** {d["topics"]}
+
+---
+
+### #2. First Last — Role, Organization
+- **Why:** ...
+- **Topics to discuss:** ...
+
+---
+
+(continue for all 25)
+
+Rules:
+- Start directly with ### #1, no preamble or introduction
+- Every entry must have the ### heading, **Why:** bullet, **Topics to discuss:** bullet, and --- divider
+- Keep each Why and Topics to 1-3 sentences, be specific and compelling"""
 
 
-async def run_matching_pipeline(df_filtered, user_name, user_profile, api_key, model,
+async def run_matching_pipeline(df_filtered, user_name, user_profile, client, deployment,
                                 chunk_size=50, min_score=8, additional_context=None,
-                                direction="get_value", user_idx=None, rate_limiter=None):
+                                direction="get_value", user_idx=None,
+                                progress_callback=None, final_callback=None):
     """
     Run the matching pipeline for a single direction:
-    1. Score all profiles in batches (in parallel, rate-limited)
+    1. Score all profiles in batches (all fired concurrently)
     2. Filter to profiles scoring >= min_score
     3. Generate final top-25 recommendations
 
     Args:
+        client: AsyncAzureOpenAI client instance
+        deployment: Azure OpenAI deployment name
         direction: "get_value" (who benefits me) or "give_value" (who I can help)
         user_idx: DataFrame index of the user's own profile to exclude from scoring
-        rate_limiter: RateLimiter instance for rate limiting API calls (shared across pipelines)
 
     Returns:
         Tuple of (recommendations_text, all_scores_dict, status_messages)
     """
-    client = genai.Client(api_key=api_key)
-    if rate_limiter is None:
-        rate_limiter = RateLimiter(max_per_minute=25)
     status_messages = []
     direction_label = "GET value" if direction == "get_value" else "GIVE value"
     status_messages.append(f"=== {direction_label} ===")
@@ -277,21 +286,19 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, api_key, m
 
         backoff_delays = [5, 10, 20]
         for attempt in range(3):
-            await rate_limiter.acquire()
+
             try:
-                response = await client.aio.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=1,
-                        response_mime_type="application/json"
-                    )
+                response = await client.chat.completions.create(
+                    model=deployment,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"},
                 )
 
-                if not response.text:
+                text = response.choices[0].message.content
+                if not text:
                     raise ValueError(f"Empty response for batch {batch_num}")
 
-                scores = json.loads(response.text)
+                scores = json.loads(text)
 
                 # Map profile numbers back to df indices
                 result = {}
@@ -307,9 +314,15 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, api_key, m
                 else:
                     raise ValueError(f"Batch {batch_num} failed after {attempt + 1} attempts: {e}")
 
-    # Run all batches in parallel
+    # Run all batches in parallel, reporting progress as each completes
     try:
-        results = await asyncio.gather(*[score_one_batch(b, i + 1) for i, b in enumerate(batches)])
+        tasks = [asyncio.ensure_future(score_one_batch(b, i + 1)) for i, b in enumerate(batches)]
+        results = []
+        for coro in asyncio.as_completed(tasks):
+            result = await coro
+            results.append(result)
+            if progress_callback:
+                progress_callback(len(results), num_batches, direction)
         status_messages.append(f"All {num_batches} batches scored")
     except Exception as e:
         status_messages.append(f"Scoring failed: {e}")
@@ -347,25 +360,36 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, api_key, m
 
     # Final recommendation call
     status_messages.append(f"Generating final top 25 from {len(top_items)} candidates...")
+    if final_callback:
+        final_callback(direction)
     final_prompt = create_final_prompt(
         user_name, user_profile, scored_text, len(top_items),
         total_count, direction, additional_context
     )
 
+    prompt_len = len(final_prompt)
+    log.info(f"[{direction_label}] Final prompt length: {prompt_len} chars, {len(top_items)} candidates")
+
     backoff_delays = [5, 10, 20]
     for attempt in range(3):
-        await rate_limiter.acquire()
         try:
-            final_response = await client.aio.models.generate_content(
-                model=model,
-                contents=final_prompt,
-                config=types.GenerateContentConfig(temperature=1)
+            log.info(f"[{direction_label}] Final call attempt {attempt + 1}/3 — sending to Azure...")
+            final_response = await client.chat.completions.create(
+                model=deployment,
+                messages=[{"role": "user", "content": final_prompt}],
             )
-            if not final_response.text:
-                raise ValueError("Empty response from final recommendation call")
+            log.info(f"[{direction_label}] Got response. Finish reason: {final_response.choices[0].finish_reason}")
+            log.info(f"[{direction_label}] Usage: {final_response.usage}")
+            text = final_response.choices[0].message.content
+            if not text:
+                refusal = getattr(final_response.choices[0].message, 'refusal', None)
+                log.info(f"[{direction_label}] Empty content! Refusal: {refusal}")
+                raise ValueError(f"Empty response (finish_reason={final_response.choices[0].finish_reason}, refusal={refusal})")
+            log.info(f"[{direction_label}] Success! Response length: {len(text)} chars")
             status_messages.append("Final recommendations generated")
-            return final_response.text, all_scores, status_messages
+            return text, all_scores, status_messages
         except Exception as e:
+            log.info(f"[{direction_label}] Final call error (attempt {attempt + 1}): {type(e).__name__}: {e}")
             if attempt < 2:
                 status_messages.append(f"Final call failed, retrying in {backoff_delays[attempt]}s...")
                 await asyncio.sleep(backoff_delays[attempt])
@@ -374,28 +398,44 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, api_key, m
                 raise
 
 
-async def run_dual_matching_pipeline(df_filtered, user_name, user_profile, api_key, model,
+async def run_dual_matching_pipeline(df_filtered, user_name, user_profile,
+                                     azure_api_key, azure_endpoint, azure_deployment,
+                                     azure_api_version="2024-12-01-preview",
                                      chunk_size=50, min_score=8, additional_context=None,
-                                     user_idx=None):
+                                     user_idx=None, progress_callback=None,
+                                     final_callback=None):
     """
     Run both get_value and give_value pipelines in parallel.
+
+    Args:
+        azure_api_key: Azure OpenAI API key
+        azure_endpoint: Azure OpenAI endpoint URL
+        azure_deployment: Azure OpenAI deployment name (e.g., "gpt-5-mini")
+        azure_api_version: Azure OpenAI API version
+        progress_callback: Called with (completed_batches, total_batches, direction) after each batch.
+        final_callback: Called with (direction) when final report generation starts.
 
     Returns:
         Tuple of (get_result, give_result)
         where each result is (recommendations_text, all_scores_dict, status_messages)
     """
-    # Shared rate limiter to stay under Gemini's 25 RPM rate limit
-    rate_limiter = RateLimiter(max_per_minute=22)  # slightly under 25 to leave headroom
+    client = AsyncAzureOpenAI(
+        api_key=azure_api_key,
+        azure_endpoint=azure_endpoint,
+        api_version=azure_api_version,
+    )
 
     get_task = run_matching_pipeline(
-        df_filtered, user_name, user_profile, api_key, model,
+        df_filtered, user_name, user_profile, client, azure_deployment,
         chunk_size=chunk_size, min_score=min_score, additional_context=additional_context,
-        direction="get_value", user_idx=user_idx, rate_limiter=rate_limiter
+        direction="get_value", user_idx=user_idx,
+        progress_callback=progress_callback, final_callback=final_callback
     )
     give_task = run_matching_pipeline(
-        df_filtered, user_name, user_profile, api_key, model,
+        df_filtered, user_name, user_profile, client, azure_deployment,
         chunk_size=chunk_size, min_score=min_score, additional_context=additional_context,
-        direction="give_value", user_idx=user_idx, rate_limiter=rate_limiter
+        direction="give_value", user_idx=user_idx,
+        progress_callback=progress_callback, final_callback=final_callback
     )
     return await asyncio.gather(get_task, give_task)
 
