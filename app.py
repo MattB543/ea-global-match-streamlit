@@ -349,17 +349,18 @@ def main():
             progress_bar = st.progress(0)
             progress_text = st.empty()
 
-            # Calculate total batches for progress tracking
+            # Calculate total batches for progress tracking. Scoring is now a
+            # single combined pass that scores both directions per call, so the
+            # batch count is NOT doubled.
             import math
             num_profiles = len(df_filtered) - (1 if user_idx is not None else 0)
-            batches_per_direction = math.ceil(num_profiles / 60)
-            total_batches = batches_per_direction * 2  # both directions
+            total_batches = math.ceil(num_profiles / 60)
 
             progress_state = {"completed": 0, "start_time": time.time(), "generating_finals": False}
             FINAL_REPORT_SECONDS = 120  # estimated time for final report generation
 
             # Show initial state immediately
-            progress_text.caption(f"Scored 0/{total_batches} batches across both pipelines — ~1m 30s remaining")
+            progress_text.caption(f"Scored 0/{total_batches} batches (both directions) — ~1m 30s remaining")
 
             def on_batch_complete(completed_in_direction, total_in_direction, direction):
                 # Don't overwrite the "generating final reports" message
@@ -382,7 +383,7 @@ def main():
                     remaining = max(0, 90 - elapsed)
                     mins, secs = divmod(int(remaining), 60)
                     eta = f"{mins}m {secs}s" if mins else f"{secs}s"
-                progress_text.caption(f"Scored {done}/{total_batches} batches across both pipelines — ~{eta} remaining")
+                progress_text.caption(f"Scored {done}/{total_batches} batches (both directions) — ~{eta} remaining")
 
             def on_final_start(direction):
                 progress_state["generating_finals"] = True

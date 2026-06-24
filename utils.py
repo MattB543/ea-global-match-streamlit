@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import random
+import hashlib
 import asyncio
 import pandas as pd
 from datetime import datetime
@@ -142,10 +143,40 @@ def format_row_as_pipe_delimited(row):
     return '|'.join(str(val) if pd.notna(val) else '' for val in row.values)
 
 
+# Columns whose names contain any of these substrings (case-insensitive) are
+# dropped from the profile sent to the LLM — they carry no matching signal and
+# just burn tokens. Note: Swapcard URLs are dropped here too because the display
+# links are built separately straight from the dataframe (build_swapcard_lookup
+# in app.py), so the scoring/ranking model never needs the raw URL.
+# Adjust this list to match your sheet's column names.
+LLM_PROFILE_EXCLUDE_SUBSTRINGS = (
+    "email",
+    "dietary",
+    "swapcard",
+    "phone",
+    "ticket",
+    "registration",
+    "timestamp",
+)
+
+
+def _include_field_for_llm(col):
+    """True if a column should be sent to the LLM (not an excluded noise field)."""
+    name = str(col).lower()
+    return not any(sub in name for sub in LLM_PROFILE_EXCLUDE_SUBSTRINGS)
+
+
 def format_profile_for_llm(row):
-    """Format a DataFrame row as a labeled JSON object for LLM consumption."""
+    """Format a DataFrame row as a labeled JSON object for LLM consumption.
+
+    Low-value/admin columns (see LLM_PROFILE_EXCLUDE_SUBSTRINGS) are omitted to
+    save tokens — they don't help matching and are sent for thousands of
+    profiles, twice (scoring + final round).
+    """
     profile = {}
     for col, val in row.items():
+        if not _include_field_for_llm(col):
+            continue
         if pd.notna(val) and str(val).strip():
             profile[col] = str(val).strip()
     return json.dumps(profile, ensure_ascii=False)
@@ -199,22 +230,41 @@ DIRECTION_FINAL = {
 }
 
 
-def create_scoring_prompt(user_profile, numbered_profiles, batch_size, total_count, direction="get_value"):
-    """Create the scoring prompt for a batch of profiles."""
-    d = DIRECTION_SCORING[direction]
+def create_scoring_prompt(user_profile, numbered_profiles, total_count):
+    """Create the COMBINED scoring prompt for a batch of profiles.
+
+    Scores every attendee on BOTH directions in a single call ("get" = value for
+    me, "give" = value I provide to them), so each profile is sent once instead
+    of twice.
+
+    Caching note: the static instruction block + the user's own profile come
+    FIRST and contain no per-batch variables (only run-constant total_count), so
+    they form a byte-identical prefix that Azure prompt caching can reuse across
+    every batch. Keep all per-batch content (the profiles) strictly after it.
+    """
+    get = DIRECTION_SCORING["get_value"]
+    give = DIRECTION_SCORING["give_value"]
 
     return f"""You are helping match attendees at EA Global, a conference for people in the Effective Altruism community.
 
-Below is MY profile, followed by a batch of {batch_size} attendee profiles (out of ~{total_count} total attendees at the conference).
+Below is MY profile, followed by a batch of attendee profiles (out of ~{total_count} total attendees at the conference).
 
-{d["heading"]}
+Score EACH attendee on TWO INDEPENDENT dimensions, each an integer from 1-10:
 
-{d["criteria"]}
+=== DIMENSION "get" — value FOR ME ===
+{get["heading"]}
+
+{get["criteria"]}
+
+=== DIMENSION "give" — value I PROVIDE TO THEM ===
+{give["heading"]}
+
+{give["criteria"]}
 
 IMPORTANT SCORING CONTEXT:
-- You are seeing {batch_size} of ~{total_count} total attendees. Score each person INDEPENDENTLY.
-- Be DISCERNING. At a conference of ~{total_count} people, only ~15-20% should score 8+. Most people are 4-6.
-- A score of 8+ means "I would regret NOT meeting this person." Reserve it for genuinely strong matches.
+- Score each person INDEPENDENTLY on each dimension. Someone can be high on one and low on the other.
+- Be DISCERNING. At a conference of ~{total_count} people, only ~15% should score 8+ on a given dimension. Most people are 4-6.
+- A score of 8+ means "I would regret NOT meeting this person" for that dimension. Reserve it for genuinely strong matches.
 - Seniority and prestige are NOT scoring criteria. Score based on specific, concrete value exchange.
 
 SCORING SCALE (be strict — most people should score 4-6):
@@ -236,9 +286,9 @@ ATTENDEE PROFILES TO SCORE:
 
 ---
 
-Return a JSON object mapping each profile number to its integer score.
-Example: {{"1": 7, "2": 9, "3": 4}}
-Score all {batch_size} profiles. Return ONLY valid JSON, nothing else."""
+Return a JSON object mapping each profile number to an object with "get" and "give" integer scores.
+Example: {{"1": {{"get": 7, "give": 4}}, "2": {{"get": 9, "give": 8}}}}
+Score every profile listed above on BOTH dimensions. Return ONLY valid JSON, nothing else."""
 
 
 def create_final_prompt(user_name, user_profile, scored_profiles_text, top_count, total_count,
@@ -296,67 +346,55 @@ def _retry_after_seconds(err):
     return None
 
 
-async def run_matching_pipeline(df_filtered, user_name, user_profile, client, deployment,
-                                chunk_size=50, min_score=8, additional_context=None,
-                                direction="get_value", user_idx=None,
-                                progress_callback=None, final_callback=None,
-                                semaphore=None):
+def _coerce_scores(obj):
+    """Pull integer (get, give) scores out of one profile's JSON value.
+
+    Tolerates the model returning a dict {"get": x, "give": y}, or a bare int
+    (treated as the same score for both), or junk (-> 0, 0).
     """
-    Run the matching pipeline for a single direction:
-    1. Score all profiles in batches (all fired concurrently)
-    2. Filter to profiles scoring >= min_score
-    3. Generate final top-25 recommendations
+    if isinstance(obj, dict):
+        g = obj.get("get", obj.get("GET", 0))
+        v = obj.get("give", obj.get("GIVE", 0))
+    elif isinstance(obj, (int, float)):
+        g = v = obj
+    else:
+        g = v = 0
+    try:
+        g = int(g)
+    except (TypeError, ValueError):
+        g = 0
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        v = 0
+    return g, v
 
-    Args:
-        client: AsyncAzureOpenAI client instance
-        deployment: Azure OpenAI deployment name
-        direction: "get_value" (who benefits me) or "give_value" (who I can help)
-        user_idx: DataFrame index of the user's own profile to exclude from scoring
 
-    Returns:
-        Tuple of (recommendations_text, all_scores_dict, status_messages, usage)
-        where usage is {"stage1": {...}, "stage2": {...}} token accumulators
-        (stage1 = batch scoring, stage2 = final report).
+async def _score_all_batches(df_filtered, user_profile, client, deployment, indices,
+                             total_count, chunk_size, cache_key, semaphore,
+                             progress_callback, status_messages):
+    """Score every profile ONCE on both directions ("get" and "give").
+
+    Returns (get_scores, give_scores, stage1_usage). Each *_scores maps a
+    DataFrame index to an integer score for that dimension.
     """
-    status_messages = []
-    direction_label = "GET value" if direction == "get_value" else "GIVE value"
-    status_messages.append(f"=== {direction_label} ===")
-
-    # Filter out the user's own profile
-    indices = df_filtered.index.tolist()
-    if user_idx is not None and user_idx in indices:
-        indices = [i for i in indices if i != user_idx]
-        status_messages.append(f"Excluded own profile (index {user_idx})")
-
-    total_count = len(indices)
-
-    # Create batches
-    batches = []
-    for i in range(0, len(indices), chunk_size):
-        batches.append(indices[i:i + chunk_size])
-
+    batches = [indices[i:i + chunk_size] for i in range(0, len(indices), chunk_size)]
     num_batches = len(batches)
-    status_messages.append(f"Scoring {total_count} profiles in {num_batches} batches of ~{chunk_size}...")
-
-    # A semaphore caps how many requests are in flight at once. When the dual
-    # pipeline passes a shared one, the cap spans both directions.
-    if semaphore is None:
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    status_messages.append(
+        f"Scoring {len(indices)} profiles in {num_batches} batches of ~{chunk_size} "
+        f"(both directions per call)..."
+    )
 
     MAX_ATTEMPTS = 6
 
     async def score_one_batch(batch_indices, batch_num):
-        """Score a single batch of profiles with retries on failure."""
+        """Score a single batch on both dimensions, with retries on failure."""
         numbered_lines = []
         for j, idx in enumerate(batch_indices, 1):
-            row = df_filtered.loc[idx]
-            profile_json = format_profile_for_llm(row)
+            profile_json = format_profile_for_llm(df_filtered.loc[idx])
             numbered_lines.append(f"Profile {j}: {profile_json}")
-
         numbered_text = "\n".join(numbered_lines)
-        prompt = create_scoring_prompt(
-            user_profile, numbered_text, len(batch_indices), total_count, direction
-        )
+        prompt = create_scoring_prompt(user_profile, numbered_text, total_count)
 
         for attempt in range(MAX_ATTEMPTS):
             try:
@@ -365,6 +403,9 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, client, de
                         model=deployment,
                         messages=[{"role": "user", "content": prompt}],
                         response_format={"type": "json_object"},
+                        # Routing hint so all batches in a run pin to the same
+                        # backend and reuse the warmed prompt-cache prefix.
+                        user=cache_key,
                     )
 
                 text = response.choices[0].message.content
@@ -372,13 +413,9 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, client, de
                     raise ValueError(f"Empty response for batch {batch_num}")
 
                 scores = json.loads(text)
-
-                # Map profile numbers back to df indices
                 result = {}
                 for j, idx in enumerate(batch_indices, 1):
-                    score = scores.get(str(j), scores.get(j, 0))
-                    result[idx] = score
-
+                    result[idx] = _coerce_scores(scores.get(str(j), scores.get(j, {})))
                 return result, batch_num, response.usage
 
             except Exception as e:
@@ -392,57 +429,79 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, client, de
                     retry_after = _retry_after_seconds(e)
                     if retry_after is not None:
                         delay = retry_after + random.uniform(0, 2)
-                    log.info(f"[{direction}] Batch {batch_num} rate-limited "
+                    log.info(f"[scoring] Batch {batch_num} rate-limited "
                              f"(attempt {attempt + 1}/{MAX_ATTEMPTS}), waiting {delay:.1f}s")
                 await asyncio.sleep(delay)
 
-    # Run all batches in parallel, reporting progress as each completes
+    results = []
+
+    def _record(r):
+        results.append(r)
+        if progress_callback:
+            progress_callback(len(results), num_batches, "scoring")
+
+    # Warm the prompt cache: run the FIRST batch alone to completion so the
+    # large shared prefix (instructions + user profile) gets cached, THEN fan
+    # the rest out concurrently to hit that warm cache. Firing everything at
+    # once races a cold cache and caches almost nothing.
     try:
-        tasks = [asyncio.ensure_future(score_one_batch(b, i + 1)) for i, b in enumerate(batches)]
-        results = []
-        for coro in asyncio.as_completed(tasks):
-            result = await coro
-            results.append(result)
-            if progress_callback:
-                progress_callback(len(results), num_batches, direction)
-        status_messages.append(f"All {num_batches} batches scored")
+        if batches:
+            _record(await score_one_batch(batches[0], 1))
+        rest = [asyncio.ensure_future(score_one_batch(b, i + 2))
+                for i, b in enumerate(batches[1:])]
+        for coro in asyncio.as_completed(rest):
+            _record(await coro)
     except Exception as e:
         status_messages.append(f"Scoring failed: {e}")
         raise
 
-    # Collect all scores and Stage 1 (scoring) token usage
-    all_scores = {}
+    status_messages.append(f"All {num_batches} batches scored")
+
+    get_scores, give_scores = {}, {}
     stage1_usage = _empty_usage()
-    for batch_scores, _, batch_usage in results:
-        all_scores.update(batch_scores)
+    for batch_result, _, batch_usage in results:
+        for idx, (g, v) in batch_result.items():
+            get_scores[idx] = g
+            give_scores[idx] = v
         _add_usage(stage1_usage, batch_usage)
 
-    # Score distribution stats
+    return get_scores, give_scores, stage1_usage
+
+
+async def _generate_final_report(df_filtered, user_name, user_profile, client, deployment,
+                                 scores, direction, min_score, additional_context,
+                                 total_count, final_callback):
+    """Filter to top-scoring profiles for one direction and generate its report.
+
+    Returns (recommendations_text, status_messages, stage2_usage).
+    """
+    direction_label = "GET value" if direction == "get_value" else "GIVE value"
+    status_messages = [f"=== {direction_label} ==="]
+
+    # Score distribution stats (for the UI bar charts)
     for score_val in range(10, 0, -1):
-        count = sum(1 for s in all_scores.values() if s == score_val)
+        count = sum(1 for s in scores.values() if s == score_val)
         if count > 0:
             status_messages.append(f"  Score {score_val}: {count} profiles")
 
-    # Filter to min_score+
     top_items = [
         (idx, score) for idx, score
-        in sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
+        in sorted(scores.items(), key=lambda x: x[1], reverse=True)
         if score >= min_score
     ]
     status_messages.append(f"{len(top_items)} profiles scored {min_score}+ (sending to final round)")
 
     if not top_items:
-        raise ValueError(f"No profiles scored {min_score}+. Try lowering the threshold.")
+        raise ValueError(f"No profiles scored {min_score}+ for {direction_label}. "
+                         f"Try lowering the threshold.")
 
     # Format top profiles with their scores for the final prompt
     scored_lines = []
     for idx, score in top_items:
-        row = df_filtered.loc[idx]
-        profile_json = format_profile_for_llm(row)
+        profile_json = format_profile_for_llm(df_filtered.loc[idx])
         scored_lines.append(f"[Score: {score}] {profile_json}")
     scored_text = "\n".join(scored_lines)
 
-    # Final recommendation call
     status_messages.append(f"Generating final top 25 from {len(top_items)} candidates...")
     if final_callback:
         final_callback(direction)
@@ -450,9 +509,8 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, client, de
         user_name, user_profile, scored_text, len(top_items),
         total_count, direction, additional_context
     )
-
-    prompt_len = len(final_prompt)
-    log.info(f"[{direction_label}] Final prompt length: {prompt_len} chars, {len(top_items)} candidates")
+    log.info(f"[{direction_label}] Final prompt length: {len(final_prompt)} chars, "
+             f"{len(top_items)} candidates")
 
     stage2_usage = _empty_usage()
     backoff_delays = [5, 10, 20]
@@ -473,8 +531,7 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, client, de
             log.info(f"[{direction_label}] Success! Response length: {len(text)} chars")
             status_messages.append("Final recommendations generated")
             _add_usage(stage2_usage, final_response.usage)
-            usage = {"stage1": stage1_usage, "stage2": stage2_usage}
-            return text, all_scores, status_messages, usage
+            return text, status_messages, stage2_usage
         except Exception as e:
             log.info(f"[{direction_label}] Final call error (attempt {attempt + 1}): {type(e).__name__}: {e}")
             if attempt < 2:
@@ -492,20 +549,25 @@ async def run_dual_matching_pipeline(df_filtered, user_name, user_profile,
                                      user_idx=None, progress_callback=None,
                                      final_callback=None):
     """
-    Run both get_value and give_value pipelines in parallel.
+    Run the full matching flow:
+      Stage 1: score every profile ONCE on both directions (combined prompt).
+      Stage 2: generate the get_value and give_value final reports concurrently.
 
     Args:
         azure_api_key: Azure OpenAI API key
         azure_endpoint: Azure OpenAI endpoint URL
-        azure_deployment: Azure OpenAI deployment name (e.g., "gpt-5-mini")
+        azure_deployment: Azure OpenAI deployment name (e.g., "gpt-5.2")
         azure_api_version: Azure OpenAI API version
-        progress_callback: Called with (completed_batches, total_batches, direction) after each batch.
-        final_callback: Called with (direction) when final report generation starts.
+        progress_callback: Called with (completed_batches, total_batches, "scoring")
+            after each scoring batch. There is now ONE scoring pass for both
+            directions, so total_batches == ceil(num_profiles / chunk_size).
+        final_callback: Called with (direction) when a final report starts.
 
     Returns:
-        Tuple of (get_result, give_result)
-        where each result is (recommendations_text, all_scores_dict,
-        status_messages, usage) — see run_matching_pipeline.
+        Tuple of (get_result, give_result) where each result is
+        (recommendations_text, scores_dict, status_messages, usage).
+        The full shared Stage-1 usage is attributed to get_result; give_result's
+        stage1 is empty, so summing get+give (as the UI does) stays correct.
     """
     client = AsyncAzureOpenAI(
         api_key=azure_api_key,
@@ -513,25 +575,49 @@ async def run_dual_matching_pipeline(df_filtered, user_name, user_profile,
         api_version=azure_api_version,
     )
 
-    # Shared across both directions so the concurrency cap covers ALL in-flight
-    # requests, not just one pipeline's worth.
+    # Exclude the user's own profile from scoring
+    indices = df_filtered.index.tolist()
+    scoring_status = []
+    if user_idx is not None and user_idx in indices:
+        indices = [i for i in indices if i != user_idx]
+        scoring_status.append(f"Excluded own profile (index {user_idx})")
+    total_count = len(indices)
+
+    # Caps in-flight requests so we don't overwhelm the deployment with 429s.
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-    get_task = run_matching_pipeline(
-        df_filtered, user_name, user_profile, client, azure_deployment,
-        chunk_size=chunk_size, min_score=min_score, additional_context=additional_context,
-        direction="get_value", user_idx=user_idx,
-        progress_callback=progress_callback, final_callback=final_callback,
-        semaphore=semaphore
+    # Stable per-user routing hint so every batch in this run pins to the same
+    # backend and reuses the warmed prompt-cache prefix.
+    cache_key = "eag-score-" + hashlib.sha256(user_profile.encode("utf-8")).hexdigest()[:16]
+
+    # Stage 1: score all profiles once on both dimensions.
+    get_scores, give_scores, stage1_usage = await _score_all_batches(
+        df_filtered, user_profile, client, azure_deployment, indices,
+        total_count, chunk_size, cache_key, semaphore, progress_callback, scoring_status
     )
-    give_task = run_matching_pipeline(
-        df_filtered, user_name, user_profile, client, azure_deployment,
-        chunk_size=chunk_size, min_score=min_score, additional_context=additional_context,
-        direction="give_value", user_idx=user_idx,
-        progress_callback=progress_callback, final_callback=final_callback,
-        semaphore=semaphore
+
+    # Stage 2: generate both final reports concurrently.
+    get_out, give_out = await asyncio.gather(
+        _generate_final_report(
+            df_filtered, user_name, user_profile, client, azure_deployment,
+            get_scores, "get_value", min_score, additional_context,
+            total_count, final_callback),
+        _generate_final_report(
+            df_filtered, user_name, user_profile, client, azure_deployment,
+            give_scores, "give_value", min_score, additional_context,
+            total_count, final_callback),
     )
-    return await asyncio.gather(get_task, give_task)
+    get_text, get_status, get_stage2 = get_out
+    give_text, give_status, give_stage2 = give_out
+
+    # Attribute the shared Stage-1 usage to the get result only, so the UI's
+    # get+give sum yields the true Stage-1 total exactly once.
+    get_usage = {"stage1": stage1_usage, "stage2": get_stage2}
+    give_usage = {"stage1": _empty_usage(), "stage2": give_stage2}
+
+    get_result = (get_text, get_scores, scoring_status + get_status, get_usage)
+    give_result = (give_text, give_scores, scoring_status + give_status, give_usage)
+    return get_result, give_result
 
 
 def save_output(full_name, content, output_dir, suffix=""):
