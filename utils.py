@@ -7,10 +7,16 @@ import json
 import logging
 import os
 import re
+import random
 import asyncio
 import pandas as pd
 from datetime import datetime
-from openai import AsyncAzureOpenAI
+from openai import AsyncAzureOpenAI, RateLimitError
+
+# Max number of scoring requests in flight at once, shared across BOTH pipelines.
+# Without this cap, every batch from both directions fires simultaneously
+# (~76 concurrent requests) and overwhelms the Azure deployment with 429s.
+MAX_CONCURRENT_REQUESTS = 6
 
 logging.basicConfig(
     filename="pipeline.log",
@@ -232,10 +238,22 @@ Rules:
 - Keep each Why and Topics to 1-3 sentences, be specific and compelling"""
 
 
+def _retry_after_seconds(err):
+    """Extract a Retry-After delay (seconds) from a RateLimitError, if provided."""
+    try:
+        value = err.response.headers.get("retry-after")
+        if value is not None:
+            return float(value)
+    except Exception:
+        pass
+    return None
+
+
 async def run_matching_pipeline(df_filtered, user_name, user_profile, client, deployment,
                                 chunk_size=50, min_score=8, additional_context=None,
                                 direction="get_value", user_idx=None,
-                                progress_callback=None, final_callback=None):
+                                progress_callback=None, final_callback=None,
+                                semaphore=None):
     """
     Run the matching pipeline for a single direction:
     1. Score all profiles in batches (all fired concurrently)
@@ -271,6 +289,13 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, client, de
     num_batches = len(batches)
     status_messages.append(f"Scoring {total_count} profiles in {num_batches} batches of ~{chunk_size}...")
 
+    # A semaphore caps how many requests are in flight at once. When the dual
+    # pipeline passes a shared one, the cap spans both directions.
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+    MAX_ATTEMPTS = 6
+
     async def score_one_batch(batch_indices, batch_num):
         """Score a single batch of profiles with retries on failure."""
         numbered_lines = []
@@ -284,15 +309,14 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, client, de
             user_profile, numbered_text, len(batch_indices), total_count, direction
         )
 
-        backoff_delays = [5, 10, 20]
-        for attempt in range(3):
-
+        for attempt in range(MAX_ATTEMPTS):
             try:
-                response = await client.chat.completions.create(
-                    model=deployment,
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"},
-                )
+                async with semaphore:
+                    response = await client.chat.completions.create(
+                        model=deployment,
+                        messages=[{"role": "user", "content": prompt}],
+                        response_format={"type": "json_object"},
+                    )
 
                 text = response.choices[0].message.content
                 if not text:
@@ -309,10 +333,19 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, client, de
                 return result, batch_num
 
             except Exception as e:
-                if attempt < 2:
-                    await asyncio.sleep(backoff_delays[attempt])
-                else:
+                if attempt >= MAX_ATTEMPTS - 1:
                     raise ValueError(f"Batch {batch_num} failed after {attempt + 1} attempts: {e}")
+
+                # Exponential backoff with jitter so retries don't all fire at once.
+                # On a 429, honor the server's Retry-After header when present.
+                delay = min(60, 5 * (2 ** attempt)) + random.uniform(0, 3)
+                if isinstance(e, RateLimitError):
+                    retry_after = _retry_after_seconds(e)
+                    if retry_after is not None:
+                        delay = retry_after + random.uniform(0, 2)
+                    log.info(f"[{direction}] Batch {batch_num} rate-limited "
+                             f"(attempt {attempt + 1}/{MAX_ATTEMPTS}), waiting {delay:.1f}s")
+                await asyncio.sleep(delay)
 
     # Run all batches in parallel, reporting progress as each completes
     try:
@@ -425,17 +458,23 @@ async def run_dual_matching_pipeline(df_filtered, user_name, user_profile,
         api_version=azure_api_version,
     )
 
+    # Shared across both directions so the concurrency cap covers ALL in-flight
+    # requests, not just one pipeline's worth.
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
     get_task = run_matching_pipeline(
         df_filtered, user_name, user_profile, client, azure_deployment,
         chunk_size=chunk_size, min_score=min_score, additional_context=additional_context,
         direction="get_value", user_idx=user_idx,
-        progress_callback=progress_callback, final_callback=final_callback
+        progress_callback=progress_callback, final_callback=final_callback,
+        semaphore=semaphore
     )
     give_task = run_matching_pipeline(
         df_filtered, user_name, user_profile, client, azure_deployment,
         chunk_size=chunk_size, min_score=min_score, additional_context=additional_context,
         direction="give_value", user_idx=user_idx,
-        progress_callback=progress_callback, final_callback=final_callback
+        progress_callback=progress_callback, final_callback=final_callback,
+        semaphore=semaphore
     )
     return await asyncio.gather(get_task, give_task)
 
