@@ -23,6 +23,8 @@ from utils import (
     filter_profiles,
     run_dual_matching_pipeline,
     save_output,
+    compute_cost,
+    PRICING_PER_1M,
 )
 
 
@@ -409,8 +411,8 @@ def main():
                 progress_bar.progress(1.0)
                 progress_text.caption("Done!")
 
-                get_response, get_scores, get_status = get_result
-                give_response, give_scores, give_status = give_result
+                get_response, get_scores, get_status, get_usage = get_result
+                give_response, give_scores, give_status, give_usage = give_result
 
                 # Inject Swapcard links into names
                 swapcard_lookup = build_swapcard_lookup(df)
@@ -451,6 +453,44 @@ def main():
                                 "Profiles": [give_dist.get(i, 0) for i in range(1, 11)]
                             }).set_index("Score")
                             st.bar_chart(chart_df)
+
+                # Token usage & cost breakdown (Stage 1 = scoring, Stage 2 = final
+                # reports; both directions summed into each stage).
+                def _merge_usage(a, b):
+                    return {k: a.get(k, 0) + b.get(k, 0) for k in set(a) | set(b)}
+
+                stage1_u = _merge_usage(get_usage["stage1"], give_usage["stage1"])
+                stage2_u = _merge_usage(get_usage["stage2"], give_usage["stage2"])
+                total_u = _merge_usage(stage1_u, stage2_u)
+
+                def _usage_row(u):
+                    return {
+                        "Input": u["prompt_tokens"],
+                        "Cached input": u["cached_tokens"],
+                        "Output (incl. thinking)": u["completion_tokens"],
+                        "of which thinking": u["reasoning_tokens"],
+                        "Cost (USD)": compute_cost(u),
+                    }
+
+                with status_container.expander("💰 Token usage & cost", expanded=True):
+                    st.caption(
+                        "Assumed pricing per 1M tokens — "
+                        f"Input ${PRICING_PER_1M['input']:.2f} · "
+                        f"Cached input ${PRICING_PER_1M['cached_input']:.2f} · "
+                        f"Output ${PRICING_PER_1M['output']:.2f} "
+                        "(reasoning/thinking billed as output)"
+                    )
+                    cost_df = pd.DataFrame({
+                        "Stage 1 · Scoring": _usage_row(stage1_u),
+                        "Stage 2 · Final reports": _usage_row(stage2_u),
+                        "Total": _usage_row(total_u),
+                    }).T
+                    display_df = cost_df.copy()
+                    for col in ["Input", "Cached input", "Output (incl. thinking)", "of which thinking"]:
+                        display_df[col] = display_df[col].map(lambda v: f"{int(v):,}")
+                    display_df["Cost (USD)"] = cost_df["Cost (USD)"].map(lambda v: f"${v:,.4f}")
+                    st.table(display_df)
+                    st.metric("Total estimated cost", f"${compute_cost(total_u):,.4f}")
 
                 # Save results
                 save_output(match_data['name'], get_response, OUTPUT_DIR, suffix="_get_value")

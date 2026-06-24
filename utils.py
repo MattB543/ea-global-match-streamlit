@@ -18,6 +18,53 @@ from openai import AsyncAzureOpenAI, RateLimitError
 # (~76 concurrent requests) and overwhelms the Azure deployment with 429s.
 MAX_CONCURRENT_REQUESTS = 6
 
+# Assumed Azure pricing, USD per 1M tokens. NOTE: Azure does NOT return prices
+# in the API response — only token counts — so these are hardcoded. CONFIRM
+# against the official Azure OpenAI pricing page before trusting the dollars.
+PRICING_PER_1M = {
+    "input": 1.75,
+    "cached_input": 0.18,
+    "output": 14.00,
+}
+
+
+def _empty_usage():
+    """A fresh token accumulator."""
+    return {"prompt_tokens": 0, "cached_tokens": 0,
+            "completion_tokens": 0, "reasoning_tokens": 0}
+
+
+def _add_usage(acc, usage):
+    """Add an OpenAI `usage` object into an accumulator dict, in place.
+
+    Note: `completion_tokens` already INCLUDES `reasoning_tokens` (the hidden
+    thinking), and `cached_tokens` are a subset of `prompt_tokens`.
+    """
+    if usage is None:
+        return acc
+    acc["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
+    acc["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
+    ptd = getattr(usage, "prompt_tokens_details", None)
+    if ptd is not None:
+        acc["cached_tokens"] += getattr(ptd, "cached_tokens", 0) or 0
+    ctd = getattr(usage, "completion_tokens_details", None)
+    if ctd is not None:
+        acc["reasoning_tokens"] += getattr(ctd, "reasoning_tokens", 0) or 0
+    return acc
+
+
+def compute_cost(usage):
+    """USD cost for an accumulator dict from _empty_usage()/_add_usage().
+
+    Output (incl. reasoning) is billed on `completion_tokens` as a whole;
+    cached input is billed at the cheaper cached rate, the rest at full input.
+    """
+    cached = usage.get("cached_tokens", 0)
+    uncached_in = max(usage.get("prompt_tokens", 0) - cached, 0)
+    return (uncached_in * PRICING_PER_1M["input"]
+            + cached * PRICING_PER_1M["cached_input"]
+            + usage.get("completion_tokens", 0) * PRICING_PER_1M["output"]) / 1_000_000
+
 logging.basicConfig(
     filename="pipeline.log",
     level=logging.INFO,
@@ -267,7 +314,9 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, client, de
         user_idx: DataFrame index of the user's own profile to exclude from scoring
 
     Returns:
-        Tuple of (recommendations_text, all_scores_dict, status_messages)
+        Tuple of (recommendations_text, all_scores_dict, status_messages, usage)
+        where usage is {"stage1": {...}, "stage2": {...}} token accumulators
+        (stage1 = batch scoring, stage2 = final report).
     """
     status_messages = []
     direction_label = "GET value" if direction == "get_value" else "GIVE value"
@@ -330,7 +379,7 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, client, de
                     score = scores.get(str(j), scores.get(j, 0))
                     result[idx] = score
 
-                return result, batch_num
+                return result, batch_num, response.usage
 
             except Exception as e:
                 if attempt >= MAX_ATTEMPTS - 1:
@@ -361,10 +410,12 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, client, de
         status_messages.append(f"Scoring failed: {e}")
         raise
 
-    # Collect all scores
+    # Collect all scores and Stage 1 (scoring) token usage
     all_scores = {}
-    for batch_scores, _ in results:
+    stage1_usage = _empty_usage()
+    for batch_scores, _, batch_usage in results:
         all_scores.update(batch_scores)
+        _add_usage(stage1_usage, batch_usage)
 
     # Score distribution stats
     for score_val in range(10, 0, -1):
@@ -403,6 +454,7 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, client, de
     prompt_len = len(final_prompt)
     log.info(f"[{direction_label}] Final prompt length: {prompt_len} chars, {len(top_items)} candidates")
 
+    stage2_usage = _empty_usage()
     backoff_delays = [5, 10, 20]
     for attempt in range(3):
         try:
@@ -420,7 +472,9 @@ async def run_matching_pipeline(df_filtered, user_name, user_profile, client, de
                 raise ValueError(f"Empty response (finish_reason={final_response.choices[0].finish_reason}, refusal={refusal})")
             log.info(f"[{direction_label}] Success! Response length: {len(text)} chars")
             status_messages.append("Final recommendations generated")
-            return text, all_scores, status_messages
+            _add_usage(stage2_usage, final_response.usage)
+            usage = {"stage1": stage1_usage, "stage2": stage2_usage}
+            return text, all_scores, status_messages, usage
         except Exception as e:
             log.info(f"[{direction_label}] Final call error (attempt {attempt + 1}): {type(e).__name__}: {e}")
             if attempt < 2:
@@ -450,7 +504,8 @@ async def run_dual_matching_pipeline(df_filtered, user_name, user_profile,
 
     Returns:
         Tuple of (get_result, give_result)
-        where each result is (recommendations_text, all_scores_dict, status_messages)
+        where each result is (recommendations_text, all_scores_dict,
+        status_messages, usage) — see run_matching_pipeline.
     """
     client = AsyncAzureOpenAI(
         api_key=azure_api_key,
